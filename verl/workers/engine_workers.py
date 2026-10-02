@@ -75,6 +75,20 @@ def _with_routing_replay_flag(enabled: bool):
     return decorator
 
 
+def _trainer_wants_expandable_segments(is_rollout: bool, device_name: str) -> bool:
+    """Whether a worker should switch its allocator to expandable segments at startup.
+
+    Only workers that host no rollout engine (the trainer side of a disaggregated / one-step-off setup): the
+    colocated path toggles expandable segments around weight sync itself, and SGLang's memory saver rejects them.
+    Long-sequence FSDP updates fragment the caching allocator badly without them: a Qwen3.5-27B LoRA update that
+    allocates 65 GB reserved 129 GB under max_split_size_mb and ran out of memory on a 140 GB GPU under torch 2.13.
+    VERL_TRAINER_EXPANDABLE_SEGMENTS=0 opts out.
+    """
+    if is_rollout or device_name == "cpu":
+        return False
+    return os.getenv("VERL_TRAINER_EXPANDABLE_SEGMENTS", "1") != "0"
+
+
 class TrainingWorker(Worker, DistProfilerExtension):
     """
     TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
@@ -475,6 +489,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        if _trainer_wants_expandable_segments(self._is_rollout, get_device_name()):
+            set_expandable_segments(True)
 
         if self._is_actor:
             omega_profiler_config = config.actor.get("profiler", {})
