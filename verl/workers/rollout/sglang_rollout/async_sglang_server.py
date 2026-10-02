@@ -186,8 +186,9 @@ class SGLangHttpServer:
         self._pd_decode_peers: list[ActorHandle] = []
         self._pd_bootstrap_host: Optional[str] = None
 
-        # used for http server
-        self._server_address = ray.util.get_node_ip_address().strip("[]")
+        # used for http server. VERL_SGLANG_HOST / VERL_SGLANG_PORT pin the address for clients outside Ray
+        # (e.g. an agent gateway configured with a fixed base_url); unset keeps the node IP and a free port.
+        self._server_address = (os.environ.get("VERL_SGLANG_HOST") or ray.util.get_node_ip_address()).strip("[]")
         self._server_port = None
 
         # used for controlling sglang server profiler
@@ -442,7 +443,9 @@ class SGLangHttpServer:
 
             add_prometheus_middleware(app)
 
-        self._server_port, self._server_task = await run_uvicorn(app, server_args, self._server_address)
+        self._server_port, self._server_task = await run_uvicorn(
+            app, server_args, self._server_address, port=int(os.environ.get("VERL_SGLANG_PORT") or 0)
+        )
         self.tokenizer_manager.server_status = ServerStatus.Up
 
     async def wake_up(self):

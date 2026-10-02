@@ -64,9 +64,10 @@ class _UvicornServerAutoPort(uvicorn.Server):
         return self.actual_port
 
 
-async def run_uvicorn(app: FastAPI, server_args, server_address) -> tuple[int, asyncio.Task]:
+async def run_uvicorn(app: FastAPI, server_args, server_address, port: int = 0) -> tuple[int, asyncio.Task]:
+    """Serve ``app`` on ``server_address``; ``port=0`` (default) lets the OS pick a free port."""
     app.server_args = server_args
-    config = uvicorn.Config(app, host=server_address, port=0, log_level="warning")
+    config = uvicorn.Config(app, host=server_address, port=port, log_level="warning")
     server = _UvicornServerAutoPort(config)
     server_task = asyncio.create_task(server.serve())
     server_port = await server.get_port()
