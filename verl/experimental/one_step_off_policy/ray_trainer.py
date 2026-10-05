@@ -33,7 +33,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.trainer.ppo import core_algos
+from verl.trainer.ppo import core_algos, multi_segment
 from verl.trainer.ppo.ray_trainer import (
     ResourcePoolManager,
     compute_response_mask,
@@ -236,7 +236,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-        batch = batch.union(gen_batch_output)
+        batch = multi_segment.align_to_outputs(batch, gen_batch_output)  # 1:1 union unless rows are segments
+        if multi_segment.is_multi_segment(batch):
+            batch = self._pad_multi_segment_batch(batch, metrics)
 
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)

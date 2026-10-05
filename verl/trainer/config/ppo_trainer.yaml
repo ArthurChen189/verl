@@ -134,6 +134,17 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Multi-segment episodes (an agent loop returns several rows per sample, see verl/trainer/ppo/multi_segment.py).
+  # Inactive unless the agent loop emits more than one output for a sample.
+  multi_segment:
+
+    # Optimizer updates per step: "fixed" (train_batch_size // ppo_mini_batch_size, whatever the row count) or
+    # "rows" (ppo_mini_batch_size * rollout.n rows per update, so the update count grows with the segments)
+    update_count: fixed
+
+    # Directory for a per-step JSONL dump of every row (ids, mask and advantage), or null for none
+    dump_dir: null
+
 # config for the trainer
 trainer:
 

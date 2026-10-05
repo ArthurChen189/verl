@@ -1172,6 +1172,11 @@ def agg_loss(
             if dp_size > 1:
                 raise ValueError("(global) batch_num_tokens is required when dp_size > 1")
             batch_num_tokens = loss_mask.sum()
+        # a mini-batch with no valid token (only padding / excluded rows) gives loss 0, not 0/0 = NaN
+        if isinstance(batch_num_tokens, torch.Tensor):
+            batch_num_tokens = batch_num_tokens.clamp(min=1)
+        else:
+            batch_num_tokens = max(batch_num_tokens, 1)
         loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
     elif loss_agg_mode == "token-sum":
         # DDP/FSDP average gradients across data-parallel ranks. Scaling each

@@ -39,7 +39,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, Res
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
-from verl.trainer.ppo import core_algos
+from verl.trainer.ppo import core_algos, multi_segment
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -214,6 +214,11 @@ def compute_advantage(
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
+    # multi-segment episodes (several rows per episode): GRPO over EPISODES, see verl/trainer/ppo/multi_segment.py
+    if multi_segment.is_multi_segment(data):
+        if adv_estimator != AdvantageEstimator.GRPO:
+            raise NotImplementedError(f"multi-segment batches support adv_estimator=grpo only, got {adv_estimator}")
+        return multi_segment.compute_episode_grpo_advantage(data, norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo)
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -1324,6 +1329,32 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
+    def _multi_segment_update_count(self) -> str:
+        return (self.config.algorithm.get("multi_segment") or {}).get("update_count", "fixed")
+
+    def _pad_multi_segment_batch(self, batch: DataProto, metrics: dict) -> DataProto:
+        """Pad a multi-segment batch with neutral rows to the row multiple the dispatch and the update need."""
+        actor = self.config.actor_rollout_ref.actor
+        if getattr(self, "use_prefix_grouper", False):
+            # its uid-group balancing would treat an episode's segments (and the padding rows) as one prefix group
+            raise NotImplementedError("multi-segment batches do not support actor.use_prefix_grouper")
+        dp = self._get_dp_size(self.actor_rollout_wg, "actor")
+        update_count = self._multi_segment_update_count()
+        divisor = multi_segment.pad_divisor(
+            dp,
+            actor.ppo_mini_batch_size,
+            self.config.actor_rollout_ref.rollout.n,
+            self.config.data.train_batch_size,
+            update_count,
+        )
+        if update_count == "fixed" and not actor.get("use_dynamic_bsz", False):
+            divisor *= actor.get("ppo_micro_batch_size_per_gpu") or 1  # per-GPU mini-batch % micro-batch == 0
+        eos = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos
+        batch, n_pad = multi_segment.pad_rows(batch, divisor, pad_token_id=pad_id, eos_token_id=eos)
+        metrics["multi_segment/dummy_rows"] = n_pad
+        return batch
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1354,13 +1385,20 @@ class RayPPOTrainer:
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
+        mini_batching = {"global_batch_size": ppo_mini_batch_size, "mini_batch_size": ppo_mini_batch_size}
+        if multi_segment.is_multi_segment(batch) and self._multi_segment_update_count() == "fixed":
+            # rows per step vary with the number of segments: keep the number of optimizer updates per step fixed
+            # (train_batch_size // ppo_mini_batch_size) instead of letting it grow with the row count
+            k = multi_segment.num_fixed_updates(
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size, self.config.data.train_batch_size
+            )
+            mini_batching = {"global_batch_size": len(batch) // k, "num_mini_batch": k}
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
             distillation_only=distillation_only,
-            global_batch_size=ppo_mini_batch_size,
-            mini_batch_size=ppo_mini_batch_size,
+            **mini_batching,
             epochs=ppo_epochs,
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},

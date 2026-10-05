@@ -32,6 +32,7 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.ppo import multi_segment
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -463,7 +464,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         del combined_gen_batch, combined_gen_output
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-        batch = batch.union(gen_batch_output)
+        batch = multi_segment.align_to_outputs(batch, gen_batch_output)  # 1:1 union unless rows are segments
+        if multi_segment.is_multi_segment(batch):
+            batch = self._pad_multi_segment_batch(batch, metrics)
 
         if "response_mask" not in batch.batch.keys():
             batch.batch["response_mask"] = compute_response_mask(batch)
@@ -744,6 +747,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # compute variance proxy metrics
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+        if multi_segment.is_multi_segment(batch):
+            metrics.update(multi_segment.compute_multi_segment_metrics(batch))
+            dump_dir = (self.config.algorithm.get("multi_segment") or {}).get("dump_dir")
+            if dump_dir:
+                multi_segment.dump_rows(batch, dump_dir, self.global_steps)
 
     def _fit_experimental(self, batch):
         # this is experimental and may be changed/removed in the future

@@ -835,7 +835,8 @@ def compute_rollout_correction_and_rejection_mask(
     """
     # Validate input masks
     if not response_mask.any():
-        raise ValueError("response_mask must contain at least one valid token (1).")
+        # a micro-batch of fully masked rows (multi-segment padding or excluded episodes): nothing to correct
+        return None, response_mask.clone(), {}
     if old_log_prob.shape != rollout_log_prob.shape:
         raise ValueError(
             f"old_log_prob shape {old_log_prob.shape} does not match rollout_log_prob shape {rollout_log_prob.shape}."
@@ -937,7 +938,8 @@ def compute_offpolicy_metrics(
         Dictionary of off-policy metrics (without prefix)
     """
     # Validate that we have at least one valid token
-    assert response_mask.any(), "Expected at least one valid token in response_mask"
+    if not response_mask.any():
+        return {}  # a fully masked micro-batch (multi-segment padding or excluded episodes) has nothing to measure
 
     metrics = {}
 

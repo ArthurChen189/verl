@@ -882,6 +882,9 @@ algorithm:
   pf_ppo:
     reweight_method: pow
     weight_pow: 2.0
+  multi_segment:
+    update_count: fixed
+    dump_dir: null
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false

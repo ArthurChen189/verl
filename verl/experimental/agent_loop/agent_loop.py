@@ -670,8 +670,12 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
+        outputs, source_index = _flatten_multi_outputs(outputs)
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs,
+            input_non_tensor_batch=batch.non_tensor_batch,
+            validate=batch.meta_info.get("validate", False),
+            source_index=source_index,
         )
         return output
 
@@ -683,7 +687,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
+    ) -> _InternalAgentLoopOutput | list[_InternalAgentLoopOutput]:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -708,7 +712,14 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            output: AgentLoopOutput | list[AgentLoopOutput] = await agent_loop.run(sampling_params, **kwargs)
+            if isinstance(output, list):
+                assert output, f"agent loop {agent_name} returned an empty list"
+                if trajectory["validate"]:
+                    # validation scores episodes 1:1 with its inputs: keep the final segment only
+                    output = output[-1]
+                else:
+                    return [await self._agent_loop_postprocess(o, False, **kwargs) for o in output]
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -1076,6 +1087,7 @@ class AgentLoopWorker:
         inputs: list[_InternalAgentLoopOutput],
         input_non_tensor_batch: dict | None = None,
         validate: bool = False,
+        source_index: list[int] | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
@@ -1119,7 +1131,12 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            if source_index is None:
+                non_tensor_batch.update(input_non_tensor_batch)
+            else:
+                non_tensor_batch.update({k: v[source_index] for k, v in input_non_tensor_batch.items()})
+        if source_index is not None:
+            non_tensor_batch["__source_index__"] = np.asarray(source_index, dtype=np.int64)
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
@@ -1163,6 +1180,37 @@ class AgentLoopWorker:
             non_tensor_batch=non_tensor_batch,
             meta_info=meta_info,
         )
+
+
+def _flatten_multi_outputs(outputs: list) -> tuple[list, list[int] | None]:
+    """Flatten agent-loop results where some samples returned a list of outputs (one row per segment).
+
+    Returns the flat outputs and, when any sample returned a list, ``source_index`` (the input row of every output) so
+    the trainer can join rows to their sample (uid, extra_info) and group them into one episode
+    (verl/trainer/ppo/multi_segment.py). Single outputs everywhere -> unchanged, ``None``.
+    """
+    if not any(isinstance(out, list) for out in outputs):
+        return outputs, None
+    flat, source_index = [], []
+    for i, out in enumerate(outputs):
+        out = out if isinstance(out, list) else [out]
+        assert out, f"agent loop returned no output for sample {i}"
+        flat.extend(out)
+        source_index.extend([i] * len(out))
+    return flat, source_index
+
+
+def _globalize_source_index(chunk_lens: list[int], outputs: list[DataProto]) -> None:
+    """Offset each worker's chunk-local ``__source_index__`` to batch-global indices (in place)."""
+    if not any("__source_index__" in out.non_tensor_batch for out in outputs):
+        return
+    offset = 0
+    for chunk_len, out in zip(chunk_lens, outputs, strict=True):
+        local = out.non_tensor_batch.get("__source_index__")
+        if local is None:  # this worker's agent loops returned single outputs: rows are 1:1 with its chunk
+            local = np.arange(len(out), dtype=np.int64)
+        out.non_tensor_batch["__source_index__"] = np.asarray(local, dtype=np.int64) + offset
+        offset += chunk_len
 
 
 async def get_trajectory_info(step, index, validate):
@@ -1268,6 +1316,7 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        _globalize_source_index([len(chunk) for chunk in chunkes], outputs)
         output = DataProto.concat(outputs)
 
         # calculate performance metrics
