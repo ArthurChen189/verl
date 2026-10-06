@@ -218,7 +218,12 @@ def compute_advantage(
     if multi_segment.is_multi_segment(data):
         if adv_estimator != AdvantageEstimator.GRPO:
             raise NotImplementedError(f"multi-segment batches support adv_estimator=grpo only, got {adv_estimator}")
-        return multi_segment.compute_episode_grpo_advantage(data, norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo)
+        ms_cfg = (config.get("multi_segment") if config is not None else None) or {}
+        return multi_segment.compute_episode_grpo_advantage(
+            data,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            mask_zero_adv=bool(ms_cfg.get("mask_zero_adv", True)),
+        )
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -782,6 +787,7 @@ class RayPPOTrainer:
         2. Worker groups for each role (actor, critic, etc.)
         """
         self.resource_pool_manager.create_resource_pool()
+        self._apply_bypass_mode_to_actor_config()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
@@ -1328,6 +1334,33 @@ class RayPPOTrainer:
         old_log_prob = tu.get_tensordict(result)
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
+
+    def _apply_bypass_mode_to_actor_config(self) -> None:
+        """Bypass mode (rollout log-probs as old log-probs) needs the bypass-mode loss on the actor workers; they bind
+        their loss config when created, so set it before the worker classes are built."""
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if rollout_corr_config is not None and rollout_corr_config.get("bypass_mode", False):
+            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode_to_config
+
+            apply_bypass_mode_to_config(self.config.actor_rollout_ref.actor.policy_loss, rollout_corr_config)
+
+    def _check_worker_policy_loss(self) -> None:
+        """Log the policy loss the actor workers actually train with and fail if it isn't the driver's."""
+        from verl.trainer.ppo.rollout_corr_helper import policy_loss_summary
+
+        expected = policy_loss_summary(self.config.actor_rollout_ref.actor)
+        infos = self.actor_rollout_wg.get_policy_loss_info()
+        print(f"[policy loss] driver {expected} | worker rank 0 of {len(infos)}: {infos[0]}", flush=True)
+        diffs = []
+        for rank, info in enumerate(infos):
+            diff = {k: (info.get(k), v) for k, v in expected.items() if info.get(k) != v}
+            if diff:
+                diffs.append((rank, diff))
+        if diffs:
+            raise RuntimeError(
+                "actor workers train with a different policy loss than the driver configured, "
+                f"(worker, driver): {diffs[:2]}"
+            )
 
     def _multi_segment_update_count(self) -> str:
         return (self.config.algorithm.get("multi_segment") or {}).get("update_count", "fixed")

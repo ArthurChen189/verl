@@ -554,3 +554,134 @@ def test_dump_rows(tmp_path):
     first = rows[0]
     assert first[ms.EPISODE_KEY] == "task0#0" and len(first["response_ids"]) == len(first["response_mask"])
     assert first["segment_kind"] == "main" and isinstance(first[ms.EPISODE_ADV_KEY], float)
+
+
+# ---------------------------------------------------------------- zero-advantage rows leave the loss, the KL and N_tok
+def test_mask_zero_adv_drops_uniform_groups_only():
+    plain = ms.compute_episode_grpo_advantage(_aligned(), norm_adv_by_std_in_grpo=False)
+    masked = ms.compute_episode_grpo_advantage(_aligned(), norm_adv_by_std_in_grpo=False, mask_zero_adv=True)
+    uid = masked.non_tensor_batch["uid"]
+    in_uniform = np.array([u == "task1" for u in uid])  # task 1: all 8 episodes scored 0
+    assert masked.non_tensor_batch[ms.ZERO_ADV_KEY].tolist() == in_uniform.tolist()
+    assert (masked.batch["response_mask"][torch.from_numpy(in_uniform)] == 0).all()
+    keep = torch.from_numpy(~in_uniform)
+    torch.testing.assert_close(masked.batch["response_mask"][keep], plain.batch["response_mask"][keep])
+    torch.testing.assert_close(masked.batch["advantages"], plain.batch["advantages"])  # A was 0 there anyway
+    # token-mean now averages over the nonzero-advantage tokens only: a larger step, same direction
+    assert _token_mean(masked).item() == pytest.approx(
+        _token_mean(plain).item()
+        * plain.batch["response_mask"].sum().item()
+        / masked.batch["response_mask"].sum().item()
+    )
+    # a KL-like term over the mask no longer includes the uniform group's tokens
+    kld = torch.rand_like(masked.batch["advantages"])
+    m = masked.batch["response_mask"]
+    kl = agg_loss(kld, m, "token-mean", dp_size=1, batch_num_tokens=int(m.sum()))
+    torch.testing.assert_close(kl, (kld * m).sum() / m.sum())
+    met = ms.compute_multi_segment_metrics(masked)
+    assert met["multi_segment/zero_adv_masked_rows"] == float(in_uniform.sum())
+    pre = sum(int(x) for x in masked.non_tensor_batch[ms.PRE_ZERO_TOKENS_KEY])
+    assert met["multi_segment/nonzero_adv_token_frac"] == pytest.approx(float(m.sum()) / pre)
+    assert ms.compute_multi_segment_metrics(plain)["multi_segment/nonzero_adv_token_frac"] == 1.0
+    assert ms.compute_multi_segment_metrics(plain)["multi_segment/zero_adv_masked_rows"] == 0.0
+
+
+def test_mask_zero_adv_keeps_single_episode_groups_and_exclusions():
+    flags = {(0, e): {"exclude_from_baseline": True} for e in range(1, N)}
+    flags[(3, 4)] = {"episode_overlong": True, "exclude_from_loss": True}
+    batch = ms.compute_episode_grpo_advantage(_aligned(flags=flags), norm_adv_by_std_in_grpo=True, mask_zero_adv=True)
+    zero = batch.non_tensor_batch[ms.ZERO_ADV_KEY]
+    eps = _episode_rows(batch)
+    # task 0 episode 0 is a group of one in the baseline: A = s (GRPO convention) -> kept; s = 0 here, so it IS zero
+    assert all(zero[i] == (abs(batch.non_tensor_batch[ms.EPISODE_ADV_KEY][i]) < 1e-12) for i in eps["task0#0"])
+    # an episode already excluded from the loss is not counted as zero-advantage-masked
+    assert not any(zero[i] for i in eps["task3#28"])
+
+
+def test_compute_advantage_reads_mask_zero_adv_from_config():
+    on = compute_advantage(_aligned(), AdvantageEstimator.GRPO, norm_adv_by_std_in_grpo=False)
+    off = compute_advantage(
+        _aligned(),
+        AdvantageEstimator.GRPO,
+        norm_adv_by_std_in_grpo=False,
+        config=OmegaConf.create({"multi_segment": {"mask_zero_adv": False}}),
+    )
+    assert any(on.non_tensor_batch[ms.ZERO_ADV_KEY]) and not any(off.non_tensor_batch[ms.ZERO_ADV_KEY])
+
+
+def test_all_masked_batch_skips_the_actor_update():
+    from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
+
+    calls = []
+    stub = SimpleNamespace(
+        metrics={},
+        timing_raw={},
+        global_steps=1,
+        config=OmegaConf.create({"trainer": {"critic_warmup": 0}}),
+        _update_actor=lambda b: calls.append(b) or DataProto(meta_info={"metrics": {}}),
+    )
+    batch = ms.compute_episode_grpo_advantage(_aligned(), norm_adv_by_std_in_grpo=False)
+    batch.batch["response_mask"].zero_()
+    SeparateRayPPOTrainer._fit_update_actor(stub, batch)
+    assert calls == [] and stub.metrics["multi_segment/skipped_update"] == 1.0
+    SeparateRayPPOTrainer._fit_update_actor(stub, ms.compute_episode_grpo_advantage(_aligned(), False))
+    assert len(calls) == 1 and stub.metrics["multi_segment/skipped_update"] == 0.0
+
+
+# ---------------------------------------------------------------- bypass mode reaches the workers, and is checked
+def _trainer_cfg(bypass=True):
+    cfg = OmegaConf.load(Path(__file__).parents[3] / "verl/trainer/config/_generated_ppo_trainer.yaml")
+    cfg.algorithm.rollout_correction = OmegaConf.create(
+        {"bypass_mode": bypass, "loss_type": "ppo_clip", "rollout_is": None, "rollout_rs": None}
+    )
+    cfg.actor_rollout_ref.actor.clip_ratio_high = 0.28
+    cfg.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
+    return cfg
+
+
+def test_bypass_mode_is_applied_before_the_actor_workers_are_built():
+    from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
+
+    seen = {}
+    stub = SimpleNamespace(config=_trainer_cfg())
+    stub._apply_bypass_mode_to_actor_config = lambda: RayPPOTrainer._apply_bypass_mode_to_actor_config(stub)
+    stub._create_actor_rollout_classes = lambda: seen.update(
+        loss_mode=stub.config.actor_rollout_ref.actor.policy_loss.loss_mode,
+        bypass=stub.config.actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode,
+    )
+    stub._create_critic_class = stub._create_reference_policy_class = stub._create_reward_model_class = lambda: None
+    SeparateRayPPOTrainer._create_worker_classes(stub)
+    assert seen == {"loss_mode": "bypass_mode", "bypass": True}
+    off = SimpleNamespace(config=_trainer_cfg(bypass=False))
+    RayPPOTrainer._apply_bypass_mode_to_actor_config(off)
+    assert off.config.actor_rollout_ref.actor.policy_loss.loss_mode == "vanilla"
+
+
+def _worker_info(cfg):
+    """What get_policy_loss_info returns on a worker built from this actor config (the worker's own conversion)."""
+    from functools import partial
+
+    from verl.utils.config import omega_conf_to_dataclass
+    from verl.workers.engine_workers import ActorRolloutRefWorker
+    from verl.workers.utils.losses import ppo_loss
+
+    actor_config = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+    worker = SimpleNamespace(actor=SimpleNamespace(loss_fn=partial(ppo_loss, config=actor_config)))
+    return ActorRolloutRefWorker.get_policy_loss_info(worker)
+
+
+def test_worker_policy_loss_info_and_startup_check():
+    cfg = _trainer_cfg()
+    stub = SimpleNamespace(config=cfg)
+    RayPPOTrainer._apply_bypass_mode_to_actor_config(stub)
+    info = _worker_info(cfg)
+    assert info["loss_fn"] == "ppo_loss" and info["loss_mode"] == "bypass_mode"
+    assert info["rollout_correction.bypass_mode"] is True and info["clip_ratio_high"] == 0.28
+    stub.actor_rollout_wg = SimpleNamespace(get_policy_loss_info=lambda: [info, info])
+    RayPPOTrainer._check_worker_policy_loss(stub)  # matches: no error
+    # the old failure: workers built before the driver switched to bypass mode
+    stale = _worker_info(_trainer_cfg())
+    assert stale["loss_mode"] == "vanilla"
+    stub.actor_rollout_wg = SimpleNamespace(get_policy_loss_info=lambda: [info, stale])
+    with pytest.raises(RuntimeError, match="different policy loss"):
+        RayPPOTrainer._check_worker_policy_loss(stub)

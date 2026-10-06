@@ -114,6 +114,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._check_worker_policy_loss()
         self._init_reward_loop()
         self._init_async_rollout_manager()
 
@@ -135,6 +136,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
     def _create_worker_classes(self):
+        self._apply_bypass_mode_to_actor_config()  # before the actor workers bind their loss config
         self._create_actor_rollout_classes()
         self._create_critic_class()
         self._create_reference_policy_class()
@@ -647,6 +649,13 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         timing_raw = self.timing_raw
         # implement critic warmup
         if self.config.trainer.critic_warmup <= self.global_steps:
+            if multi_segment.is_multi_segment(batch):
+                # every row masked (all groups uniform / excluded): a zero-gradient optimizer step would still move the
+                # weights through Adam's momentum and weight decay, so skip the update instead
+                skip = not bool(batch.batch["response_mask"].any())
+                metrics["multi_segment/skipped_update"] = float(skip)
+                if skip:
+                    return batch
             # update actor
             with marked_timer("update_actor", timing_raw, color="red"):
                 actor_output = self._update_actor(batch)

@@ -548,6 +548,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.actor.set_loss_fn(loss_fn=loss_fn)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_policy_loss_info(self) -> dict:
+        """The policy-loss settings this rank trains with: the config bound into its loss function in init_model."""
+        from verl.trainer.ppo.rollout_corr_helper import policy_loss_summary
+
+        loss_fn = self.actor.loss_fn
+        name = getattr(getattr(loss_fn, "func", loss_fn), "__name__", type(loss_fn).__name__)
+        return {"loss_fn": name, **policy_loss_summary(loss_fn.keywords["config"])}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
         """Manual control of load/offload"""
         self.actor.to(device=device, model=model, optimizer=optimizer, grad=grad)

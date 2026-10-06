@@ -1108,6 +1108,53 @@ def compute_rollout_corr_metrics_from_logprobs(
     return metrics_with_prefix
 
 
+def apply_bypass_mode_to_config(policy_loss_config, rollout_corr_config) -> None:
+    """The config half of :func:`apply_bypass_mode`: make the actor's policy loss the bypass-mode loss.
+
+    Call it BEFORE the actor workers are created. Engine workers bind their ActorConfig into the loss function once,
+    in init_model, so editing the driver's copy afterwards (as the per-step apply_bypass_mode does) never reaches them:
+    they kept training with the `vanilla` loss and computed no rollout_corr/* metrics.
+    """
+    from omegaconf import open_dict
+
+    with open_dict(policy_loss_config):
+        # Pass rollout_correction config to actor for loss computation and metrics
+        policy_loss_config["rollout_correction"] = rollout_corr_config
+        # Always use bypass_mode loss function which handles both loss_types
+        policy_loss_config["loss_mode"] = "bypass_mode"
+
+
+_LOSS_SUMMARY_KEYS = (
+    "clip_ratio",
+    "clip_ratio_low",
+    "clip_ratio_high",
+    "clip_ratio_c",
+    "loss_agg_mode",
+    "use_kl_loss",
+    "kl_loss_coef",
+    "kl_loss_type",
+)
+
+
+def policy_loss_summary(actor_config) -> dict[str, Any]:
+    """Flat scalar view of the policy-loss settings of an actor config (driver DictConfig or worker ActorConfig), so the
+    driver can check that the workers train with the loss it configured."""
+
+    def get(obj, key):
+        if obj is None:
+            return None
+        return obj.get(key) if hasattr(obj, "get") else getattr(obj, key, None)
+
+    policy_loss = get(actor_config, "policy_loss")
+    rc = get(policy_loss, "rollout_correction")
+    out: dict[str, Any] = {"loss_mode": get(policy_loss, "loss_mode") or "vanilla"}
+    for key in ("bypass_mode", "loss_type", "rollout_is", "rollout_rs"):
+        out[f"rollout_correction.{key}"] = get(rc, key)
+    for key in _LOSS_SUMMARY_KEYS:
+        out[key] = get(actor_config, key)
+    return {k: (float(v) if isinstance(v, float) else v) for k, v in out.items()}
+
+
 def apply_bypass_mode(
     batch: DataProto,
     rollout_corr_config: Optional[RolloutCorrectionConfig] = None,
@@ -1128,7 +1175,6 @@ def apply_bypass_mode(
     Note:
         The implementation is copied from szrlee <szrlee@gmail.com>.
     """
-    from omegaconf import open_dict
 
     if "rollout_log_probs" not in batch.batch:
         raise ValueError(
@@ -1139,8 +1185,5 @@ def apply_bypass_mode(
     # Use rollout log probs as old log probs (zero-cost substitution)
     batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
 
-    with open_dict(policy_loss_config):
-        # Pass rollout_correction config to actor for loss computation and metrics
-        policy_loss_config["rollout_correction"] = rollout_corr_config
-        # Always use bypass_mode loss function which handles both loss_types
-        policy_loss_config["loss_mode"] = "bypass_mode"
+    # (a no-op repeat when the trainer applied it before creating the workers, see apply_bypass_mode_to_config)
+    apply_bypass_mode_to_config(policy_loss_config, rollout_corr_config)

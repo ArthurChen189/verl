@@ -916,6 +916,7 @@ algorithm:
   multi_segment:
     update_count: fixed
     dump_dir: null
+    mask_zero_adv: true
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false

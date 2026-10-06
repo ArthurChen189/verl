@@ -145,6 +145,10 @@ algorithm:
     # Directory for a per-step JSONL dump of every row (ids, mask and advantage), or null for none
     dump_dir: null
 
+    # Zero the loss mask of rows whose episode advantage is 0 (uniform groups), so they leave the policy loss, the KL
+    # term and the token-mean denominator instead of diluting the step (see verl/trainer/ppo/multi_segment.py)
+    mask_zero_adv: true
+
 # config for the trainer
 trainer:
 

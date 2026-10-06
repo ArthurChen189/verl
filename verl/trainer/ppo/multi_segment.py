@@ -27,12 +27,20 @@ Columns this module adds or reads (non_tensor_batch, one value per row):
   ``exclude_from_loss``     True -> the row's response_mask is zeroed after the advantage is computed
   ``exclude_from_baseline`` True -> the row's episode is left out of its group's baseline (mean / std)
   ``is_padding``            True for synthetic rows added by :func:`pad_rows`
+  ``zero_adv_masked``       True -> the row's episode advantage is 0 and ``mask_zero_adv`` zeroed its mask
 
 Advantage (:func:`compute_episode_grpo_advantage`): the episode score is the sum of ``token_level_rewards`` over ALL
 rows of the episode (so it does not matter which row carries the reward), grouped by ``uid`` OVER EPISODES (never
 over rows, which would weight episodes by their number of segments), baseline = mean over the group's episodes,
 optional std normalisation (``norm_adv_by_std_in_grpo``; Dr.GRPO = off), broadcast to every response token of every
 row of the episode.
+
+Zero-advantage rows (``mask_zero_adv``, algorithm.multi_segment.mask_zero_adv): under token-mean a row with advantage 0
+adds nothing to the policy-gradient numerator but still counts in the token denominator and in the KL term, so a step
+in which half the groups are uniform (all episodes scored the same) takes a ~2x smaller policy step with a relatively
+stronger KL pull than one with none. With the flag, rows whose episode advantage is 0 get their mask zeroed too: they
+leave the loss, the KL and the token count. For binary rewards that is exactly the uniform groups of >= 2 episodes (the
+mean of identical values is exact, so their advantage is exactly 0, with or without std normalisation).
 """
 
 from __future__ import annotations
@@ -56,6 +64,9 @@ EXCLUDE_LOSS_KEY = "exclude_from_loss"
 EXCLUDE_BASELINE_KEY = "exclude_from_baseline"
 PADDING_KEY = "is_padding"
 EPISODE_ADV_KEY = "episode_advantage"
+ZERO_ADV_KEY = "zero_adv_masked"
+PRE_ZERO_TOKENS_KEY = "loss_tokens_pre_zero_mask"
+ZERO_ADV_EPS = 1e-12
 _FLAG_KEYS = (EXCLUDE_LOSS_KEY, EXCLUDE_BASELINE_KEY, PADDING_KEY)
 
 
@@ -172,9 +183,11 @@ def pad_rows(batch: DataProto, divisor: int, pad_token_id: int, eos_token_id: in
 
 
 def compute_episode_grpo_advantage(
-    data: DataProto, norm_adv_by_std_in_grpo: bool = True, epsilon: float = 1e-6
+    data: DataProto, norm_adv_by_std_in_grpo: bool = True, epsilon: float = 1e-6, mask_zero_adv: bool = False
 ) -> DataProto:
-    """Episode-level GRPO for multi-segment batches; writes ``advantages`` / ``returns`` and applies exclusions."""
+    """Episode-level GRPO for multi-segment batches; writes ``advantages`` / ``returns`` and applies exclusions.
+
+    ``mask_zero_adv``: also zero the mask of rows whose episode advantage is 0 (see the module docstring)."""
     rewards = data.batch["token_level_rewards"]
     response_mask = data.batch["response_mask"]
     row_score = rewards.sum(dim=-1).to(torch.float64)
@@ -211,6 +224,14 @@ def compute_episode_grpo_advantage(
     new_mask = response_mask.clone()
     if excl_loss.any():
         new_mask[torch.from_numpy(excl_loss)] = 0
+    data.non_tensor_batch[PRE_ZERO_TOKENS_KEY] = new_mask.sum(-1).numpy().astype(object)
+    zero_rows = np.array([abs(ep_adv[ep]) < ZERO_ADV_EPS for ep in episodes], dtype=bool) & ~excl_loss
+    zero_rows &= (new_mask.sum(-1) > 0).numpy()
+    if mask_zero_adv and zero_rows.any():
+        new_mask[torch.from_numpy(zero_rows)] = 0
+    else:
+        zero_rows[:] = False
+    data.non_tensor_batch[ZERO_ADV_KEY] = zero_rows.astype(object)
     advantages = row_adv.unsqueeze(-1) * new_mask.to(torch.float32)
     data.batch["response_mask"] = new_mask
     data.batch["advantages"] = advantages
@@ -250,6 +271,11 @@ def compute_multi_segment_metrics(batch: DataProto) -> dict[str, float]:
         if ep in ep_reward:
             by_uid[nt["uid"][rows[0]]].append(ep_reward[ep])
     trained_total = float(trained[torch.from_numpy(real)].sum())
+    zero_masked = _flag(batch, ZERO_ADV_KEY) & real
+    pre_zero = nt.get(PRE_ZERO_TOKENS_KEY)
+    loss_tokens_pre = (
+        float(sum(int(pre_zero[i]) for i in np.flatnonzero(real))) if pre_zero is not None else trained_total
+    )
     summary_rows = torch.from_numpy(np.array([k == "summary" for k in kinds], dtype=bool) & real)
     real_t = torch.from_numpy(real)
     m = {
@@ -274,6 +300,9 @@ def compute_multi_segment_metrics(batch: DataProto) -> dict[str, float]:
         if trained_total
         else 0.0,
         "multi_segment/trained_tokens": trained_total,
+        # share of the loss tokens (after the exclusions) with a nonzero advantage, i.e. that survive mask_zero_adv
+        "multi_segment/nonzero_adv_token_frac": (trained_total / loss_tokens_pre) if loss_tokens_pre else 0.0,
+        "multi_segment/zero_adv_masked_rows": float(zero_masked.sum()),
     }
     if ep_reward:
         comp_rewards = [ep_reward[ep] for ep, c in compacted.items() if c]
@@ -304,6 +333,8 @@ def dump_rows(batch: DataProto, dump_dir: str, step: int) -> str:
             "segment_truncated",
             EXCLUDE_LOSS_KEY,
             EXCLUDE_BASELINE_KEY,
+            ZERO_ADV_KEY,
+            PRE_ZERO_TOKENS_KEY,
             EPISODE_ADV_KEY,
             "polar_session_id",
             "cve",
