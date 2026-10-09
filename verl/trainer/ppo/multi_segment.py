@@ -41,6 +41,16 @@ in which half the groups are uniform (all episodes scored the same) takes a ~2x 
 stronger KL pull than one with none. With the flag, rows whose episode advantage is 0 get their mask zeroed too: they
 leave the loss, the KL and the token count. For binary rewards that is exactly the uniform groups of >= 2 episodes (the
 mean of identical values is exact, so their advantage is exactly 0, with or without std normalisation).
+
+Cost penalty (:func:`apply_episode_cost_penalty`, algorithm.multi_segment.cost_penalty, off by default): before the
+advantage, each episode's reward is reduced by ``coef * min(cost / budget, 1)``, where ``cost`` is a per-episode column
+the agent loop emits (``episode_<signal>``, e.g. ``episode_cost_usd``; cyber-train's training/rollout/segments.py
+``episode_cost``). With ``apply_to: success`` (the default) only episodes whose raw score is above ``success_threshold``
+pay it, so the policy is never rewarded for failing cheaply (giving up early) and, with ``coef < 1``, a solve always
+beats a failure; among the group's solves the cheaper ones get the larger advantage. The penalty goes into a copy of
+``token_level_rewards`` only: ``token_level_scores`` (and so ``multi_segment/success_rate``, ``critic/score/*`` and
+validation) stay the raw outcome. Requires Dr.GRPO (``norm_adv_by_std_in_grpo: false``): with std normalisation the
+small cost differences inside an all-solved group would be blown up to unit-scale advantages.
 """
 
 from __future__ import annotations
@@ -66,6 +76,18 @@ PADDING_KEY = "is_padding"
 EPISODE_ADV_KEY = "episode_advantage"
 ZERO_ADV_KEY = "zero_adv_masked"
 PRE_ZERO_TOKENS_KEY = "loss_tokens_pre_zero_mask"
+COST_PENALTY_KEY = "episode_cost_penalty"
+# per-episode cost columns emitted by the agent loop (identical on every row of an episode)
+COST_COLUMNS = (
+    "episode_cost_usd",
+    "episode_input_tokens",
+    "episode_output_tokens",
+    "episode_think_tokens",
+    "episode_model_calls",
+    "episode_n_traces",
+    "episode_summaries",
+    "episode_run_s",
+)
 ZERO_ADV_EPS = 1e-12
 _FLAG_KEYS = (EXCLUDE_LOSS_KEY, EXCLUDE_BASELINE_KEY, PADDING_KEY)
 
@@ -180,6 +202,67 @@ def pad_rows(batch: DataProto, divisor: int, pad_token_id: int, eos_token_id: in
     out = DataProto.concat([DataProto(batch=batch.batch, non_tensor_batch=batch.non_tensor_batch), pad])
     out.meta_info = batch.meta_info
     return out, n_pad
+
+
+def _episode_rows(data: DataProto) -> dict[str, list[int]]:
+    """episode_id -> its real (non-padding) row indices, in batch order."""
+    pad = _flag(data, PADDING_KEY)
+    rows: dict[str, list[int]] = defaultdict(list)
+    for i, ep in enumerate(data.non_tensor_batch[EPISODE_KEY]):
+        if not pad[i]:
+            rows[ep].append(i)
+    return rows
+
+
+def apply_episode_cost_penalty(data: DataProto, cfg: dict | None, norm_adv_by_std_in_grpo: bool) -> DataProto:
+    """Subtract each episode's cost penalty from (a copy of) ``token_level_rewards``; see the module docstring.
+
+    cfg (algorithm.multi_segment.cost_penalty): enable, signal (column ``episode_<signal>``), budget (> 0), coef
+    (in [0, 1)), apply_to (success | all), success_threshold. Writes ``episode_cost_penalty`` on every real row (0 on
+    padding). No-op unless enabled."""
+    if not cfg or not cfg.get("enable", False):
+        return data
+    if norm_adv_by_std_in_grpo:
+        raise ValueError(
+            "algorithm.multi_segment.cost_penalty needs norm_adv_by_std_in_grpo=false (Dr.GRPO): std normalisation "
+            "would scale the cost differences inside an all-solved group up to unit-size advantages"
+        )
+    signal = str(cfg.get("signal", "cost_usd"))
+    key = f"episode_{signal}"
+    budget, coef = float(cfg.get("budget", 0.0)), float(cfg.get("coef", 0.0))
+    apply_to, threshold = str(cfg.get("apply_to", "success")), float(cfg.get("success_threshold", 0.5))
+    if budget <= 0:
+        raise ValueError(f"cost_penalty.budget must be > 0, got {budget}")
+    if not 0.0 <= coef < 1.0:
+        raise ValueError(f"cost_penalty.coef must be in [0, 1) so a solve always beats a failure, got {coef}")
+    if apply_to not in ("success", "all"):
+        raise ValueError(f"cost_penalty.apply_to must be 'success' or 'all', got {apply_to!r}")
+    col = data.non_tensor_batch.get(key)
+    if col is None:
+        raise KeyError(f"cost_penalty.signal={signal!r} needs the per-row column {key!r}; the agent loop did not emit it")
+
+    rewards = data.batch["token_level_rewards"].clone()  # it aliases token_level_scores: keep the raw outcome intact
+    row_score = rewards.sum(dim=-1).to(torch.float64)
+    prompt_len = data.batch["prompts"].shape[-1]
+    resp_attn = data.batch["attention_mask"][:, prompt_len:]
+    final = _flag(data, "is_final_segment")
+    penalty = np.zeros(len(data), dtype=np.float64)
+    for rows in _episode_rows(data).values():
+        score = float(row_score[rows].sum())
+        cost = col[rows[0]]
+        if cost is None or (apply_to == "success" and score <= threshold):
+            continue
+        p = coef * min(max(float(cost), 0.0) / budget, 1.0)
+        if p <= 0.0:
+            continue
+        i = next((r for r in reversed(rows) if final[r]), rows[-1])  # the row carrying the reward
+        valid = torch.nonzero(resp_attn[i]).flatten()
+        pos = int(valid[-1]) if len(valid) else rewards.shape[-1] - 1
+        rewards[i, pos] -= p
+        penalty[rows] = p
+    data.batch["token_level_rewards"] = rewards
+    data.non_tensor_batch[COST_PENALTY_KEY] = penalty.astype(object)
+    return data
 
 
 def compute_episode_grpo_advantage(
@@ -304,6 +387,29 @@ def compute_multi_segment_metrics(batch: DataProto) -> dict[str, float]:
         "multi_segment/nonzero_adv_token_frac": (trained_total / loss_tokens_pre) if loss_tokens_pre else 0.0,
         "multi_segment/zero_adv_masked_rows": float(zero_masked.sum()),
     }
+    # per-episode cost columns (from the agent loop) and the cost penalty, averaged over episodes, not rows
+    for key in (*COST_COLUMNS, COST_PENALTY_KEY):
+        col = nt.get(key)
+        if col is None:
+            continue
+        vals = {ep: col[rows[0]] for ep, rows in ep_rows.items() if col[rows[0]] is not None}
+        if not vals:
+            continue
+        name = key.removeprefix("episode_")
+        m[f"multi_segment/{name}/mean"] = float(np.mean([float(v) for v in vals.values()]))
+        if key == COST_PENALTY_KEY:
+            m["multi_segment/cost_penalty/applied_frac"] = float(np.mean([float(v) > 0 for v in vals.values()]))
+        elif key in ("episode_cost_usd", "episode_output_tokens") and ep_reward:
+            for label, keep in (("solved", lambda r: r > 0.5), ("failed", lambda r: r <= 0.5)):
+                sel = [float(v) for ep, v in vals.items() if ep in ep_reward and keep(ep_reward[ep])]
+                if sel:
+                    m[f"multi_segment/{name}/{label}_mean"] = float(np.mean(sel))
+    capped = nt.get("episode_capped")
+    if capped is not None:
+        m["multi_segment/capped_episode_rate"] = sum(bool(capped[rows[0]]) for rows in ep_rows.values()) / n_ep
+    if "token_level_rewards" in batch.batch:
+        shaped = batch.batch["token_level_rewards"].sum(-1).tolist()
+        m["multi_segment/shaped_reward_mean"] = float(np.mean([sum(shaped[i] for i in rows) for rows in ep_rows.values()]))
     if ep_reward:
         comp_rewards = [ep_reward[ep] for ep, c in compacted.items() if c]
         m["multi_segment/success_rate_given_compaction"] = float(np.mean(comp_rewards)) if comp_rewards else 0.0
@@ -336,6 +442,9 @@ def dump_rows(batch: DataProto, dump_dir: str, step: int) -> str:
             ZERO_ADV_KEY,
             PRE_ZERO_TOKENS_KEY,
             EPISODE_ADV_KEY,
+            COST_PENALTY_KEY,
+            *COST_COLUMNS,
+            "episode_capped",
             "polar_session_id",
             "cve",
             "slug",

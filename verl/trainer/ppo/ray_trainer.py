@@ -219,6 +219,7 @@ def compute_advantage(
         if adv_estimator != AdvantageEstimator.GRPO:
             raise NotImplementedError(f"multi-segment batches support adv_estimator=grpo only, got {adv_estimator}")
         ms_cfg = (config.get("multi_segment") if config is not None else None) or {}
+        data = multi_segment.apply_episode_cost_penalty(data, ms_cfg.get("cost_penalty"), norm_adv_by_std_in_grpo)
         return multi_segment.compute_episode_grpo_advantage(
             data,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,

@@ -149,6 +149,30 @@ algorithm:
     # term and the token-mean denominator instead of diluting the step (see verl/trainer/ppo/multi_segment.py)
     mask_zero_adv: true
 
+    # Cost penalty (see verl/trainer/ppo/multi_segment.py): before the advantage, an episode's reward is reduced by
+    # coef * min(cost / budget, 1), cost = the per-row column episode_<signal> the agent loop emits. apply_to: success
+    # charges only episodes scoring above success_threshold (never rewards failing cheaply). Needs Dr.GRPO
+    # (norm_adv_by_std_in_grpo: false). token_level_scores, success_rate and validation stay the raw outcome.
+    cost_penalty:
+
+      # Off by default
+      enable: false
+
+      # Cost column suffix: cost_usd | output_tokens | input_tokens | think_tokens | model_calls | run_s | ...
+      signal: cost_usd
+
+      # Cost at which the penalty saturates at coef (same unit as the signal)
+      budget: 1.0
+
+      # Largest penalty, in reward units; must be < 1 so a solve always beats a failure
+      coef: 0.25
+
+      # success (only episodes scoring above success_threshold pay) | all
+      apply_to: success
+
+      # Raw episode score above which an episode counts as solved
+      success_threshold: 0.5
+
 # config for the trainer
 trainer:
 
