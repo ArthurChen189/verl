@@ -697,20 +697,37 @@ def _with_cost(batch: DataProto, alias: bool = True) -> DataProto:
     ``token_level_rewards`` IS ``token_level_scores`` (separation/ray_trainer.py assigns it without a copy)."""
     eps = batch.non_tensor_batch[ms.EPISODE_KEY]
     te = [(int(ep.split("#")[0].removeprefix("task")), int(ep.split("#")[1]) % N) for ep in eps]
-    batch.non_tensor_batch["episode_cost_usd"] = np.array([_ep_cost(t, e) for t, e in te], dtype=object)
-    batch.non_tensor_batch["episode_output_tokens"] = np.array([1000 * (e + 1) for _, e in te], dtype=object)
-    batch.non_tensor_batch["episode_capped"] = np.array([e == 7 for _, e in te], dtype=object)
+    col = lambda f: np.array([f(t, e) for t, e in te], dtype=object)  # noqa: E731
+    batch.non_tensor_batch["episode_cost_usd"] = col(_ep_cost)
+    batch.non_tensor_batch["episode_output_tokens"] = col(lambda t, e: 1000 * (e + 1))
+    batch.non_tensor_batch["episode_turns"] = col(lambda t, e: 5 + 2 * e)
+    batch.non_tensor_batch["episode_tool_calls"] = col(lambda t, e: 10 + t)
+    batch.non_tensor_batch["episode_capped"] = col(lambda t, e: e == 7)
     if alias:
         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
     return batch
 
 
-CP = {"enable": True, "signal": "cost_usd", "budget": 0.2, "coef": 0.25, "apply_to": "success", "success_threshold": 0.5}
+CP = {"enable": True, "signal": "cost_usd", "scale": 0.2, "k": 2.0, "q": 1.0, "lam1": 0.1, "max_penalty": 0.5,
+      "apply_to": "success", "success_threshold": 0.5}
+
+
+def _want(x: float, cfg=CP) -> float:
+    return min(cfg["lam1"] * ms.cost_curve(x, cfg["k"], cfg["q"]) / ms.cost_curve(1.0, cfg["k"], cfg["q"]),
+               cfg["max_penalty"])
 
 
 def _ep_sum(batch: DataProto, key: str) -> dict[str, float]:
     v = batch.batch[key].sum(-1).tolist()
     return {ep: sum(v[i] for i in rows) for ep, rows in _episode_rows(batch).items()}
+
+
+def test_cost_curve_shapes():
+    for x in (0.0, 0.3, 1.0, 7.5):
+        assert ms.cost_curve(x, 2.0, 1.0) == pytest.approx(math.log1p(2 * x) / 2)
+        assert ms.cost_curve(x, 2.0, 0.0) == pytest.approx(x)  # q = 0: linear
+        assert ms.cost_curve(x, 2.0, 2.0) == pytest.approx(x / (1 + 2 * x))
+        assert ms.cost_curve(x, 2.0, 1.0 - 1e-7) == pytest.approx(ms.cost_curve(x, 2.0, 1.0), rel=1e-5)
 
 
 def test_cost_penalty_charges_solves_only_and_keeps_raw_scores():
@@ -721,13 +738,29 @@ def test_cost_penalty_charges_solves_only_and_keeps_raw_scores():
     shaped, rows = _ep_sum(out, "token_level_rewards"), _episode_rows(out)
     for ep, idx in rows.items():
         t, e = int(ep.split("#")[0][4:]), int(ep.split("#")[1]) % N
-        want = CP["coef"] * min(_ep_cost(t, e) / CP["budget"], 1.0) if REWARDS[t][e] else 0.0
-        assert shaped[ep] == pytest.approx(REWARDS[t][e] - want)
+        x = _ep_cost(t, e) / CP["scale"]
+        want = _want(x) if REWARDS[t][e] else 0.0
+        assert shaped[ep] == pytest.approx(REWARDS[t][e] - want)  # R' = R (1 - lambda C(x)) for R in {0, 1}
         assert all(out.non_tensor_batch[ms.COST_PENALTY_KEY][i] == pytest.approx(want) for i in idx)
+        assert all(out.non_tensor_batch[ms.COST_X_KEY][i] == pytest.approx(x) for i in idx)
     # the penalty sits on the final (reward-carrying) row only
     final = [i for i, f in enumerate(out.non_tensor_batch["is_final_segment"]) if f]
     diff = (raw - out.batch["token_level_rewards"]).sum(-1)
     assert diff[[i for i in range(len(out)) if i not in final]].abs().max() == 0
+
+
+def test_cost_penalty_weighted_x_and_the_cap():
+    cfg = {**CP, "weights": {"turns": 0.5, "tool_calls": 0.5}, "norms": {"turns": 10.0, "tool_calls": 20.0},
+           "max_penalty": 0.1}
+    out = ms.apply_episode_cost_penalty(_with_cost(_aligned()), cfg, norm_adv_by_std_in_grpo=False)
+    rows = _episode_rows(out)
+    for t, e in ((0, 1), (3, 7)):
+        x = 0.5 * (5 + 2 * e) / 10 + 0.5 * (10 + t) / 20
+        i = rows[f"task{t}#{t * N + e}"][0]
+        assert out.non_tensor_batch[ms.COST_X_KEY][i] == pytest.approx(x)
+        assert out.non_tensor_batch[ms.COST_PENALTY_KEY][i] == pytest.approx(_want(x, cfg))
+    pens = [float(v) for v in out.non_tensor_batch[ms.COST_PENALTY_KEY] if v]
+    assert max(pens) == pytest.approx(0.1) and min(pens) < 0.1  # x > 1 solves hit the cap, cheaper ones do not
 
 
 def test_cost_penalty_orders_solves_by_cost_and_trains_all_solved_groups():
@@ -749,13 +782,11 @@ def test_cost_penalty_orders_solves_by_cost_and_trains_all_solved_groups():
     assert min(adv[f"task1#{e}"] for e in (9, 11)) > max(adv[f"task1#{e}"] for e in (8, 10, 12, 13, 14, 15))
 
 
-def test_cost_penalty_apply_to_all_saturates_and_noop_when_disabled():
-    cfg = {**CP, "apply_to": "all", "budget": 0.05}
+def test_cost_penalty_apply_to_all_and_noop_when_disabled():
+    cfg = {**CP, "apply_to": "all"}
     out = ms.apply_episode_cost_penalty(_with_cost(_aligned()), cfg, norm_adv_by_std_in_grpo=False)
     pen = out.non_tensor_batch[ms.COST_PENALTY_KEY]
-    rows = _episode_rows(out)
-    assert REWARDS[0][0] == 0 and pen[rows["task0#0"][0]] == pytest.approx(0.25 * 0.01 / 0.05)  # a failure pays too
-    assert pen[rows["task3#31"][0]] == pytest.approx(0.25)  # cost 0.32 > budget: saturates at coef
+    assert REWARDS[0][0] == 0 and pen[_episode_rows(out)["task0#0"][0]] == pytest.approx(_want(0.01 / 0.2))
     plain = _with_cost(_aligned())
     before = plain.batch["token_level_rewards"]
     for off in (None, {}, {**CP, "enable": False}):
@@ -767,11 +798,16 @@ def test_cost_penalty_guards():
     b = _with_cost(_aligned())
     with pytest.raises(ValueError, match="norm_adv_by_std_in_grpo"):
         ms.apply_episode_cost_penalty(b, CP, norm_adv_by_std_in_grpo=True)
-    for bad in ({"coef": 1.0}, {"coef": -0.1}, {"budget": 0}, {"apply_to": "failed"}):
+    for bad in ({"max_penalty": 1.0}, {"lam1": -0.1}, {"scale": 0}, {"k": 0}, {"apply_to": "failed"},
+                {"weights": {"turns": 1.0}, "norms": {}}):
         with pytest.raises(ValueError):
             ms.apply_episode_cost_penalty(_with_cost(_aligned()), {**CP, **bad}, norm_adv_by_std_in_grpo=False)
-    with pytest.raises(KeyError, match="episode_think_tokens"):
-        ms.apply_episode_cost_penalty(_with_cost(_aligned()), {**CP, "signal": "think_tokens"}, False)
+    with pytest.raises(KeyError, match="episode_thinking"):
+        ms.apply_episode_cost_penalty(_with_cost(_aligned()), {**CP, "signal": "thinking"}, False)
+    with pytest.raises(KeyError, match="episode_message"):
+        ms.apply_episode_cost_penalty(
+            _with_cost(_aligned()), {**CP, "weights": {"message": 1.0}, "norms": {"message": 1.0}}, False
+        )
 
 
 def test_cost_penalty_skips_padding_and_reaches_metrics_and_dump(tmp_path):
@@ -779,22 +815,21 @@ def test_cost_penalty_skips_padding_and_reaches_metrics_and_dump(tmp_path):
     assert n_pad > 0
     batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
     cfg = OmegaConf.create({"multi_segment": {"cost_penalty": CP, "mask_zero_adv": True}})
-    batch = compute_advantage(
-        batch, AdvantageEstimator.GRPO, num_repeat=N, norm_adv_by_std_in_grpo=False, config=cfg
-    )
+    batch = compute_advantage(batch, AdvantageEstimator.GRPO, num_repeat=N, norm_adv_by_std_in_grpo=False, config=cfg)
     pen = batch.non_tensor_batch[ms.COST_PENALTY_KEY]
     pad = batch.non_tensor_batch[ms.PADDING_KEY]
     assert all(pen[i] == 0 for i in range(len(batch)) if pad[i])
     m = ms.compute_multi_segment_metrics(batch)
     solved = [(t, e) for t in range(4) for e in range(N) if REWARDS[t][e]]
-    want = [CP["coef"] * min(_ep_cost(t, e) / CP["budget"], 1.0) for t, e in solved]
+    want = [_want(_ep_cost(t, e) / CP["scale"]) for t, e in solved]
     assert m["multi_segment/cost_penalty/mean"] == pytest.approx(sum(want) / 32)
     assert m["multi_segment/cost_penalty/applied_frac"] == pytest.approx(len(solved) / 32)
     assert m["multi_segment/cost_usd/mean"] == pytest.approx(np.mean([_ep_cost(t, e) for t in range(4) for e in range(N)]))
     assert m["multi_segment/cost_usd/solved_mean"] == pytest.approx(np.mean([_ep_cost(t, e) for t, e in solved]))
-    assert m["multi_segment/output_tokens/mean"] == pytest.approx(1000 * np.mean(range(1, N + 1)))
+    assert m["multi_segment/cost_x/solved_mean"] == pytest.approx(np.mean([_ep_cost(t, e) / 0.2 for t, e in solved]))
+    assert m["multi_segment/turns/mean"] == pytest.approx(np.mean([5 + 2 * e for e in range(N)]))
     assert m["multi_segment/capped_episode_rate"] == pytest.approx(1 / N)
     assert m["multi_segment/success_rate"] == pytest.approx(np.mean(REWARDS))  # raw, not shaped
     assert m["multi_segment/shaped_reward_mean"] == pytest.approx(np.mean(REWARDS) - sum(want) / 32)
     row = json.loads(Path(ms.dump_rows(batch, str(tmp_path), step=1)).read_text().splitlines()[0])
-    assert row["episode_cost_usd"] == pytest.approx(_ep_cost(0, 0)) and ms.COST_PENALTY_KEY in row
+    assert row["episode_cost_usd"] == pytest.approx(_ep_cost(0, 0)) and ms.COST_PENALTY_KEY in row and ms.COST_X_KEY in row

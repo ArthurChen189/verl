@@ -149,23 +149,40 @@ algorithm:
     # term and the token-mean denominator instead of diluting the step (see verl/trainer/ppo/multi_segment.py)
     mask_zero_adv: true
 
-    # Cost penalty (see verl/trainer/ppo/multi_segment.py): before the advantage, an episode's reward is reduced by
-    # coef * min(cost / budget, 1), cost = the per-row column episode_<signal> the agent loop emits. apply_to: success
-    # charges only episodes scoring above success_threshold (never rewards failing cheaply). Needs Dr.GRPO
-    # (norm_adv_by_std_in_grpo: false). token_level_scores, success_rate and validation stay the raw outcome.
+    # Cost penalty (see verl/trainer/ppo/multi_segment.py): before the advantage, a solved episode's reward is reduced
+    # by lambda * C(x), x = sum_i w_i * episode_<i> / m_i (x = 1: a typical solved episode), C(x) = log(1 + kx) / k at
+    # q = 1, lambda = lam1 / C(1). apply_to: success charges only episodes scoring above success_threshold (never
+    # rewards failing cheaply). Needs Dr.GRPO (norm_adv_by_std_in_grpo: false). token_level_scores, success_rate and
+    # validation stay the raw outcome.
     cost_penalty:
 
       # Off by default
       enable: false
 
-      # Cost column suffix: cost_usd | output_tokens | input_tokens | think_tokens | model_calls | run_s | ...
+      # Component weights {name: w} over the columns episode_<name> (thinking, tool_call, message, tool_output,
+      # tool_calls, turns, ...), summing to 1; empty: x = episode_<signal> / scale
+      weights: {}
+
+      # Per-component normaliser {name: m}: its mean over the base policy's solved episodes
+      norms: {}
+
+      # Single-column x when weights is empty: cost_usd | output_tokens | input_tokens | model_calls | run_s | ...
       signal: cost_usd
 
-      # Cost at which the penalty saturates at coef (same unit as the signal)
-      budget: 1.0
+      # Divisor of the single column (its typical solved value)
+      scale: 1.0
 
-      # Largest penalty, in reward units; must be < 1 so a solve always beats a failure
-      coef: 0.25
+      # Shape of C(x) = [(1 + kx)^(1-q) - 1] / (k (1-q)): q = 1 is log(1 + kx) / k, q = 0 is linear
+      k: 2.0
+
+      # Concavity of C(x), see k
+      q: 1.0
+
+      # Penalty of a typical solved episode (x = 1), in reward units
+      lam1: 0.05
+
+      # Largest penalty of one episode; < 1 so a solve always beats a failure
+      max_penalty: 0.5
 
       # success (only episodes scoring above success_threshold pay) | all
       apply_to: success

@@ -859,9 +859,14 @@ algorithm:
     mask_zero_adv: true
     cost_penalty:
       enable: false
+      weights: {}
+      norms: {}
       signal: cost_usd
-      budget: 1.0
-      coef: 0.25
+      scale: 1.0
+      k: 2.0
+      q: 1.0
+      lam1: 0.05
+      max_penalty: 0.5
       apply_to: success
       success_threshold: 0.5
 distillation:
