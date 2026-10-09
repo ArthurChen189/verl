@@ -97,6 +97,7 @@ COST_COLUMNS = (
     "episode_cost_usd",
     "episode_input_tokens",
     "episode_output_tokens",
+    "episode_title_tokens",
     "episode_model_calls",
     "episode_n_traces",
     "episode_summaries",
