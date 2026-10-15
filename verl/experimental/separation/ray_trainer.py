@@ -111,6 +111,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         2. Worker groups for each role (actor, critic, etc.)
         """
         self._check_prompt_mean_config()  # before any worker exists: a bad mini-batching config fails in seconds
+        self._check_refill_config()  # a stray data.gen_batch_size would silently change every step's batch
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()

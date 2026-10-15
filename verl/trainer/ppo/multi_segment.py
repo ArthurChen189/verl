@@ -247,6 +247,84 @@ def pad_rows(batch: DataProto, divisor: int, pad_token_id: int, eos_token_id: in
     return out, n_pad
 
 
+def truthy(v: Any) -> bool:
+    """A config flag that may arrive as a string through CLI overrides ("false" / "off" / "None" are False)."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def select_refill_uids(
+    uid_order: list, ep_uid: dict, ep_score: dict, ep_in_base: dict, keep: int, eps: float = 1e-9
+) -> tuple[list, dict[str, float]]:
+    """Oversample / refill (algorithm.multi_segment.refill): which ``keep`` tasks of an oversampled step to train on.
+
+    ``uid_order``: the step's tasks in dataloader order; ``ep_uid`` / ``ep_score`` / ``ep_in_base``: per episode, its
+    task, raw score and whether it is in the baseline. A task is informative when its in-baseline episodes do not all
+    score the same (a uniform group has advantage 0 and no gradient; fewer than 2 in-baseline episodes count as
+    uniform, the baseline guard would zero them). Keeps the first ``keep`` informative tasks, then fills with uniform
+    ones, both in dataloader order (so the draw stays deterministic). Returns (kept uids, in dataloader order;
+    counts)."""
+    scores: dict[Any, list[float]] = defaultdict(list)
+    for ep, u in ep_uid.items():
+        if ep_in_base[ep]:
+            scores[u].append(float(ep_score[ep]))
+    informative, uniform = [], []
+    for u in uid_order:
+        s = scores.get(u, [])
+        (informative if len(s) >= 2 and max(s) - min(s) > eps else uniform).append(u)
+    n_inf = min(len(informative), keep)
+    n_fill = min(len(uniform), keep - n_inf)
+    kept = set(informative[:n_inf]) | set(uniform[:n_fill])
+    out = [u for u in uid_order if u in kept]
+    return out, {
+        "candidates": float(len(uid_order)),
+        "informative": float(len(informative)),
+        "kept_informative": float(n_inf),
+        "filled_uniform": float(n_fill),
+    }
+
+
+def apply_refill(data: DataProto, keep: int) -> tuple[DataProto, dict[str, float]]:
+    """Keep the rows of the ``keep`` tasks :func:`select_refill_uids` picks from an oversampled generation batch.
+
+    Runs right after :func:`align_to_outputs`, before padding and balancing (both depend on the row count), on the raw
+    outcome (``rm_scores`` from the agent loop, else ``token_level_scores``) summed per episode. Episodes flagged
+    ``exclude_from_baseline`` (e.g. exhausted infra failures) do not count toward a task's uniformity."""
+    nt = data.non_tensor_batch
+    if "rm_scores" in data.batch.keys():
+        row_score = data.batch["rm_scores"].sum(-1).tolist()
+    elif "token_level_scores" in data.batch.keys():
+        row_score = data.batch["token_level_scores"].sum(-1).tolist()
+    else:
+        raise KeyError("refill needs the raw outcome per row (rm_scores from the agent loop, or token_level_scores)")
+    uids = nt["uid"]
+    episodes = nt[EPISODE_KEY] if EPISODE_KEY in nt else np.array([f"row{i}" for i in range(len(data))], dtype=object)
+    pad, excl = _flag(data, PADDING_KEY), _flag(data, EXCLUDE_BASELINE_KEY)
+    # dataloader order: a task's first episode index (__source_index__ // n preserves it; without it, row order)
+    src = nt.get(SOURCE_INDEX_KEY)
+    first: dict[Any, int] = {}
+    ep_uid: dict[Any, Any] = {}
+    ep_score: dict[Any, float] = defaultdict(float)
+    ep_in_base: dict[Any, bool] = {}
+    for i, (u, ep) in enumerate(zip(uids, episodes, strict=True)):
+        if pad[i]:
+            continue
+        pos = int(src[i]) if src is not None else i
+        first[u] = min(first.get(u, pos), pos)
+        ep_uid[ep] = u
+        ep_score[ep] += float(row_score[i])
+        ep_in_base[ep] = ep_in_base.get(ep, True) and not bool(excl[i])
+    uid_order = sorted(first, key=first.get)
+    if len(uid_order) < keep:
+        raise ValueError(f"refill: the generation batch has {len(uid_order)} tasks, fewer than the {keep} to keep")
+    kept, counts = select_refill_uids(uid_order, ep_uid, ep_score, ep_in_base, keep)
+    kept_set = set(kept)
+    rows = np.flatnonzero(np.array([(u in kept_set) and not pad[i] for i, u in enumerate(uids)], dtype=bool))
+    out = data.select_idxs(rows)
+    return out, {f"multi_segment/refill/{k}": v for k, v in counts.items()}
+
+
 def _episode_rows(data: DataProto) -> dict[str, list[int]]:
     """episode_id -> its real (non-padding) row indices, in batch order."""
     pad = _flag(data, PADDING_KEY)

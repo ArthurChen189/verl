@@ -915,6 +915,8 @@ algorithm:
       anchor: calibrated
       anchor_quantile: 0.5
       min_pass_rate: 0.0
+    refill:
+      enable: false
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false

@@ -241,6 +241,15 @@ algorithm:
       # Pass-rate gate: a group whose pass rate is <= this pays nothing (protects exploration on hard tasks); 0 = off
       min_pass_rate: 0.0
 
+    # Oversample and refill (one-step-off trainer only): generate data.gen_batch_size (> train_batch_size) tasks per
+    # step and train on the first train_batch_size whose raw episode scores are not uniform, filling with uniform ones in
+    # order if too few. Off: data.gen_batch_size must be null (or equal train_batch_size). Polar must run
+    # gen_batch_size * rollout.n sessions per step.
+    refill:
+
+      # Off by default
+      enable: false
+
 # config for the trainer
 trainer:
 

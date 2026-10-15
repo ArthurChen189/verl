@@ -1396,6 +1396,39 @@ class RayPPOTrainer:
         if self.config.algorithm.get("multi_segment") and self._multi_segment_update_count() != "fixed":
             raise ValueError("actor.loss_agg_mode=prompt-mean needs algorithm.multi_segment.update_count=fixed")
 
+    # oversample / refill (algorithm.multi_segment.refill) is implemented by the one-step-off trainer only
+    supports_refill = False
+
+    def _refill_enabled(self) -> bool:
+        ms = self.config.algorithm.get("multi_segment") or {}
+        return multi_segment.truthy((ms.get("refill") or {}).get("enable", False))
+
+    def _check_refill_config(self) -> None:
+        """data.gen_batch_size (prompts generated per step) must equal train_batch_size unless refill is on: a stray
+        gen_batch_size would silently change every step's batch (and the per-step task draw that run comparisons pair
+        on). With refill, it must exceed train_batch_size, and the trainer must implement it."""
+        gen = self.config.data.get("gen_batch_size", None)
+        if isinstance(gen, str) and gen.strip().lower() in ("", "none", "null"):
+            gen = None
+        tbs = int(self.config.data.train_batch_size)
+        if not self._refill_enabled():
+            if gen is not None and int(gen) != tbs:
+                raise ValueError(
+                    f"data.gen_batch_size={gen} differs from data.train_batch_size={tbs} but "
+                    "algorithm.multi_segment.refill.enable is false: unset gen_batch_size, or enable refill"
+                )
+            return
+        if not self.supports_refill:
+            raise NotImplementedError(
+                "algorithm.multi_segment.refill is implemented by the one-step-off trainer only, "
+                f"not {type(self).__name__}"
+            )
+        if gen is None or int(gen) <= tbs:
+            raise ValueError(
+                f"algorithm.multi_segment.refill needs data.gen_batch_size > data.train_batch_size ({tbs}): it "
+                "generates the extra tasks it refills from"
+            )
+
     def _finalize_loss_inputs(self, batch: DataProto) -> dict[str, float]:
         """After compute_advantage: the multi-segment token channels, then the prompt-mean weights; returns metrics."""
         if multi_segment.is_multi_segment(batch):

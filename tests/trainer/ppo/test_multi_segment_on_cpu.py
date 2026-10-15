@@ -1244,3 +1244,70 @@ def test_generate_sequences_passes_global_steps_to_agent_loops():
     del batch.meta_info["global_steps"]
     asyncio.run(AgentLoopWorker.generate_sequences(worker, batch))
     assert "global_steps" not in seen[0]
+
+
+# ---------------------------------------------------------------- oversample / refill (algorithm.multi_segment.refill)
+def test_select_refill_uids_keeps_informative_tasks_first_in_dataloader_order():
+    order = ["a", "b", "c", "d", "e"]
+    scores = {"a": [0, 0], "b": [0, 1], "c": [1, 1], "d": [1, 0], "e": [0, 1]}
+    ep_uid = {f"{u}#{k}": u for u, s in scores.items() for k in range(len(s))}
+    ep_score = {f"{u}#{k}": v for u, s in scores.items() for k, v in enumerate(s)}
+    in_base = dict.fromkeys(ep_uid, True)
+    kept, m = ms.select_refill_uids(order, ep_uid, ep_score, in_base, keep=2)
+    assert kept == ["b", "d"] and m == {"candidates": 5.0, "informative": 3.0, "kept_informative": 2.0,
+                                       "filled_uniform": 0.0}
+    kept, m = ms.select_refill_uids(order, ep_uid, ep_score, in_base, keep=4)
+    assert kept == ["a", "b", "d", "e"] and m["kept_informative"] == 3.0 and m["filled_uniform"] == 1.0
+    # an out-of-baseline episode does not make a group informative; fewer than 2 in-baseline episodes = uniform
+    in_base = {**in_base, "b#1": False, "d#0": False, "e#0": False, "e#1": False}
+    kept, m = ms.select_refill_uids(order, ep_uid, ep_score, in_base, keep=2)
+    assert kept == ["a", "b"] and m["informative"] == 0.0 and m["filled_uniform"] == 2.0
+
+
+def test_apply_refill_selects_rows_of_the_kept_tasks():
+    batch = _aligned()  # task0 mixed, task1 all-fail, task2 mixed, task3 mixed
+    out, m = ms.apply_refill(batch, keep=2)
+    assert set(out.non_tensor_batch["uid"]) == {"task0", "task2"}
+    assert len(out) == sum(SEGMENTS[0]) + sum(SEGMENTS[2])
+    assert m == {"multi_segment/refill/candidates": 4.0, "multi_segment/refill/informative": 3.0,
+                 "multi_segment/refill/kept_informative": 2.0, "multi_segment/refill/filled_uniform": 0.0}
+    out, m = ms.apply_refill(_aligned(), keep=4)
+    assert len(out) == len(batch) and m["multi_segment/refill/filled_uniform"] == 1.0
+    # dataloader order comes from __source_index__, not the row order
+    rev = batch.select_idxs(np.arange(len(batch))[::-1].copy())
+    assert set(ms.apply_refill(rev, keep=2)[0].non_tensor_batch["uid"]) == {"task0", "task2"}
+    # task0's two solves leave the baseline -> task0 is uniform, task3 takes its place
+    flags = {(0, 1): {"exclude_from_baseline": True}, (0, 4): {"exclude_from_baseline": True}}
+    assert set(ms.apply_refill(_aligned(flags=flags), keep=2)[0].non_tensor_batch["uid"]) == {"task2", "task3"}
+    with pytest.raises(ValueError, match="fewer than"):
+        ms.apply_refill(_aligned(), keep=5)
+
+
+def _refill_stub(gen_batch_size, enable, supports=False, train_bs=8):
+    stub = RayPPOTrainer.__new__(RayPPOTrainer)
+    stub.config = OmegaConf.create(
+        {
+            "data": {"train_batch_size": train_bs, "gen_batch_size": gen_batch_size},
+            "algorithm": {"multi_segment": {"refill": {"enable": enable}}},
+        }
+    )
+    stub.supports_refill = supports
+    return stub
+
+
+def test_refill_config_check():
+    for gen in (None, 8, "None", "null"):
+        RayPPOTrainer._check_refill_config(_refill_stub(gen, False))  # off: gen_batch_size unset or = train
+    with pytest.raises(ValueError, match="gen_batch_size=10 differs"):
+        RayPPOTrainer._check_refill_config(_refill_stub(10, False))
+    with pytest.raises(ValueError, match="gen_batch_size=10 differs"):
+        RayPPOTrainer._check_refill_config(_refill_stub(10, "false"))  # a CLI string "false" is off
+    with pytest.raises(NotImplementedError, match="one-step-off"):
+        RayPPOTrainer._check_refill_config(_refill_stub(12, True))
+    for gen in (None, 8):
+        with pytest.raises(ValueError, match="gen_batch_size > data.train_batch_size"):
+            RayPPOTrainer._check_refill_config(_refill_stub(gen, True, supports=True))
+    RayPPOTrainer._check_refill_config(_refill_stub(12, True, supports=True))
+    from verl.experimental.one_step_off_policy.ray_trainer import OneStepOffRayTrainer
+
+    assert OneStepOffRayTrainer.supports_refill and not RayPPOTrainer.supports_refill

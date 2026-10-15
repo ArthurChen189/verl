@@ -47,6 +47,8 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 
 class OneStepOffRayTrainer(SeparateRayPPOTrainer):
+    supports_refill = True  # algorithm.multi_segment.refill: see _async_gen_next_batch
+
     def __init__(
         self,
         config,
@@ -237,6 +239,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
         batch = multi_segment.align_to_outputs(batch, gen_batch_output)  # 1:1 union unless rows are segments
+        if self._refill_enabled():
+            # oversampled (data.gen_batch_size tasks): keep train_batch_size of them, informative (non-uniform) first,
+            # before padding / balancing, which depend on the row count; num_fixed_updates sees train_batch_size
+            batch, refill_metrics = multi_segment.apply_refill(batch, int(self.config.data.train_batch_size))
+            metrics.update(refill_metrics)
         if multi_segment.is_multi_segment(batch):
             batch = self._pad_multi_segment_batch(batch, metrics)
 
