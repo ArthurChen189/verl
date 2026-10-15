@@ -420,9 +420,14 @@ def set_prompt_loss_weights(data: DataProto) -> dict[str, float]:
 
     mask = data.batch["response_mask"]
     uids = data.non_tensor_batch["uid"]
+    counts = mask.to(torch.bool).sum(-1)
+    if not bool(counts.any()):
+        # every group uniform (or excluded): nothing to weigh. Zero weights, and the trainer skips this update
+        # (separation/ray_trainer.py: skip = not response_mask.any()) instead of compute_prompt_loss_weights raising.
+        data.batch[PROMPT_WEIGHTS_KEY] = torch.zeros(mask.shape[0], dtype=torch.float64, device=mask.device)
+        return {"loss/prompt_mean_weight_sum": 0.0, "loss/prompt_mean_prompt_count": 0.0}
     weights = compute_prompt_loss_weights(mask, uids)
     data.batch[PROMPT_WEIGHTS_KEY] = weights
-    counts = mask.to(torch.bool).sum(-1)
     return {
         "loss/prompt_mean_weight_sum": float((weights * counts).sum()),
         "loss/prompt_mean_prompt_count": float(len({u for u, c in zip(uids, counts.tolist(), strict=True) if c > 0})),

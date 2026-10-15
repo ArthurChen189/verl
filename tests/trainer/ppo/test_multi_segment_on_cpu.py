@@ -908,6 +908,16 @@ def test_prompt_mean_weights_over_segments():
     torch.testing.assert_close(agg_loss(loss_mat, mask, "prompt-mean", prompt_loss_weights=w), ref)
 
 
+def test_prompt_mean_all_uniform_step_gives_zero_weights_not_an_error():
+    # every group uniform -> mask_zero_adv leaves no loss token; the trainer then skips the update, so the weights
+    # must not raise on the way there
+    batch = _graded()
+    batch.batch["response_mask"] = torch.zeros_like(batch.batch["response_mask"])
+    m = ms.set_prompt_loss_weights(batch)
+    assert m == {"loss/prompt_mean_weight_sum": 0.0, "loss/prompt_mean_prompt_count": 0.0}
+    assert (batch.batch[ms.PROMPT_WEIGHTS_KEY] == 0).all()
+
+
 def test_prompt_mean_config_check_and_finalize():
     cfg = _trainer_cfg()
     cfg.actor_rollout_ref.actor.loss_agg_mode = "prompt-mean"
