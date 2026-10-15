@@ -210,6 +210,7 @@ class ActorConfig(BaseConfig):
 
         valid_loss_agg_modes = [
             "token-mean",
+            "prompt-mean",
             "token-sum",
             "seq-mean-token-sum",
             "seq-mean-token-mean",
@@ -217,6 +218,18 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.loss_agg_mode == "prompt-mean":
+            # MiMo allows the vanilla PPO loss only; bypass mode with loss_type ppo_clip is the same PPO-clip objective
+            # against the rollout log-probs (rollout_corr_helper.apply_bypass_mode_to_config sets loss_mode
+            # "bypass_mode" on the workers), so it is allowed too
+            loss_mode = self.policy_loss.get("loss_mode", "vanilla")
+            rc = self.policy_loss.get("rollout_correction", None)
+            loss_type = (rc.get("loss_type", "ppo_clip") if rc is not None else "ppo_clip") or "ppo_clip"
+            if not (loss_mode == "vanilla" or (loss_mode == "bypass_mode" and loss_type == "ppo_clip")):
+                raise ValueError(
+                    "prompt-mean requires the vanilla PPO policy loss (or bypass mode with loss_type ppo_clip), got "
+                    f"loss_mode={loss_mode!r}, rollout_correction.loss_type={loss_type!r}"
+                )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
