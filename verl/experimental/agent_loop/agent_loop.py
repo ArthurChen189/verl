@@ -656,10 +656,16 @@ class AgentLoopWorker:
         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
         # Do not forward it to concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
+        # the trainer's step counter when this generation was launched, for agent loops that log per-step diagnostics
+        # (cyber-train's bridges read kwargs["global_steps"]). One-step-off: the batches trained at steps 1 and 2 are
+        # both launched at 1; after that the batch launched at k is trained at step k + 1. Validation: the current step.
+        gen_step = batch.meta_info.get("global_steps")
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            if gen_step is not None:
+                kwargs.setdefault("global_steps", gen_step)
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
