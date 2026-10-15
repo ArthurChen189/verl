@@ -110,6 +110,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self._check_prompt_mean_config()  # before any worker exists: a bad mini-batching config fails in seconds
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
@@ -530,7 +531,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 entropy_agg = agg_loss(
                     loss_mat=entropys,
                     loss_mask=response_masks,
-                    loss_agg_mode=actor_config.loss_agg_mode,
+                    # a metric only: prompt-mean weights don't exist before the advantage, use token-mean
+                    loss_agg_mode="token-mean"
+                    if actor_config.loss_agg_mode == "prompt-mean"
+                    else actor_config.loss_agg_mode,
                     loss_scale_factor=actor_config.loss_scale_factor,
                 )
                 old_log_prob_metrics = {
@@ -632,6 +636,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                 config=self.config.algorithm,
             )
+            # multi-segment token channels, then the prompt-mean weights (they need the final mask)
+            metrics.update(self._finalize_loss_inputs(batch))
         return batch
 
     def _fit_update_critic(self, batch: DataProto) -> DataProto:
@@ -757,10 +763,13 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         gradient_norm = metrics.get("actor/grad_norm", None)
         metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
         if multi_segment.is_multi_segment(batch):
-            metrics.update(multi_segment.compute_multi_segment_metrics(batch))
-            dump_dir = (self.config.algorithm.get("multi_segment") or {}).get("dump_dir")
+            ms_cfg = self.config.algorithm.get("multi_segment") or {}
+            threshold = float((ms_cfg.get("cost_penalty") or {}).get("success_threshold", 0.5))
+            metrics.update(multi_segment.compute_multi_segment_metrics(batch, success_threshold=threshold))
+            dump_dir = ms_cfg.get("dump_dir")
             if dump_dir:
                 multi_segment.dump_rows(batch, dump_dir, self.global_steps)
+                multi_segment.dump_pass_rates(batch, dump_dir, self.global_steps, success_threshold=threshold)
 
     def _fit_experimental(self, batch):
         # this is experimental and may be changed/removed in the future

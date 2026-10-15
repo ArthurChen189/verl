@@ -149,6 +149,47 @@ algorithm:
     # term and the token-mean denominator instead of diluting the step (see verl/trainer/ppo/multi_segment.py)
     mask_zero_adv: true
 
+    # A task whose baseline has fewer in-baseline episodes than this (e.g. all but one excluded as infra failures)
+    # gets advantage 0 for all its episodes, instead of a mean-0 baseline that hands a lone solve +1; 1 = plain GRPO
+    min_baseline_episodes: 2
+
+    # Token channels over the agent loop's span columns (tool_error_spans + tool_error_kinds, repetition_spans), applied
+    # after the episode advantage. strategy: off | monitor (metrics only) | mask (marked tokens leave the loss) |
+    # adv_signed (MiMo's signed rebalance: marked tokens of positive episodes -> 0, of negative episodes -> kappa * A,
+    # each sign's mass handed back to that sign's clean tokens with alpha <= max_scale, beta >= min_scale)
+    tool_error:
+
+      # off | monitor | mask | adv_signed
+      strategy: "off"
+
+      # Multiplier of a marked token's negative advantage (adv_signed), >= 1
+      kappa: 2.0
+
+      # Lower bound of the clean negative tokens' scale beta (adv_signed)
+      min_scale: 0.5
+
+      # Upper bound of the clean positive tokens' scale alpha (adv_signed)
+      max_scale: 2.0
+
+      # Tool-error kinds that mark tokens: format (unknown tool, bad arguments / schema / JSON) and/or execution (file
+      # not found, edit oldString not found, ...)
+      kinds: [format, execution]
+
+    # Repetition loops (spans from the agent loop's n-gram detector); same keys as tool_error, without kinds
+    repetition:
+
+      # off | monitor | mask | adv_signed
+      strategy: "off"
+
+      # Multiplier of a marked token's negative advantage (adv_signed), >= 1
+      kappa: 2.0
+
+      # Lower bound of the clean negative tokens' scale beta (adv_signed)
+      min_scale: 0.5
+
+      # Upper bound of the clean positive tokens' scale alpha (adv_signed)
+      max_scale: 2.0
+
     # Cost penalty (see verl/trainer/ppo/multi_segment.py): before the advantage, a solved episode's reward is reduced
     # by lambda * C(x), x = sum_i w_i * episode_<i> / m_i (x = 1: a typical solved episode), C(x) = log(1 + kx) / k at
     # q = 1, lambda = lam1 / C(1). apply_to: success charges only episodes scoring above success_threshold (never

@@ -833,3 +833,320 @@ def test_cost_penalty_skips_padding_and_reaches_metrics_and_dump(tmp_path):
     assert m["multi_segment/shaped_reward_mean"] == pytest.approx(np.mean(REWARDS) - sum(want) / 32)
     row = json.loads(Path(ms.dump_rows(batch, str(tmp_path), step=1)).read_text().splitlines()[0])
     assert row["episode_cost_usd"] == pytest.approx(_ep_cost(0, 0)) and ms.COST_PENALTY_KEY in row and ms.COST_X_KEY in row
+
+
+# ---------------------------------------------------------------- baseline guard (min_baseline_episodes)
+def _lone_solve_flags():
+    """Task 2: episode 0 is the only solve; exclude every other episode from the baseline -> a group of one."""
+    return {(2, e): {"exclude_from_baseline": True} for e in range(1, N)}
+
+
+def test_baseline_guard_zeroes_groups_without_a_baseline():
+    plain = ms.compute_episode_grpo_advantage(_aligned(flags=_lone_solve_flags()), norm_adv_by_std_in_grpo=False)
+    guarded = ms.compute_episode_grpo_advantage(
+        _aligned(flags=_lone_solve_flags()), norm_adv_by_std_in_grpo=False, min_baseline_episodes=2
+    )
+    eps = _episode_rows(plain)
+    # plain GRPO convention: a group of one has mean 0, so the lone solve gets +1
+    assert plain.non_tensor_batch[ms.EPISODE_ADV_KEY][eps["task2#16"][0]] == pytest.approx(1.0)
+    uid = guarded.non_tensor_batch["uid"]
+    task2 = np.array([u == "task2" for u in uid])
+    assert all(float(a) == 0.0 for a in guarded.non_tensor_batch[ms.EPISODE_ADV_KEY][task2])
+    assert guarded.non_tensor_batch[ms.BASELINE_GUARDED_KEY].tolist() == task2.tolist()
+    # other tasks are untouched
+    keep = torch.from_numpy(~task2)
+    torch.testing.assert_close(guarded.batch["advantages"][keep], plain.batch["advantages"][keep])
+    m = ms.compute_multi_segment_metrics(guarded)
+    assert m["multi_segment/guarded_groups"] == 1.0
+    assert ms.compute_multi_segment_metrics(plain)["multi_segment/guarded_groups"] == 0.0
+
+
+def test_baseline_guard_defaults_to_two_in_compute_advantage_and_ignores_padding():
+    batch, n_pad = ms.pad_rows(_aligned(flags=_lone_solve_flags()), divisor=64, pad_token_id=PAD, eos_token_id=EOS)
+    assert n_pad > 0
+    out = compute_advantage(
+        batch, AdvantageEstimator.GRPO, norm_adv_by_std_in_grpo=False, config=OmegaConf.create({"multi_segment": {}})
+    )
+    pad = ms._flag(out, ms.PADDING_KEY)
+    guarded = np.array(out.non_tensor_batch[ms.BASELINE_GUARDED_KEY], dtype=bool)
+    assert not guarded[pad].any()  # padding rows are their own (empty) groups, never reported as guarded
+    assert ms.compute_multi_segment_metrics(out)["multi_segment/guarded_groups"] == 1.0
+    # a healthy batch is never guarded
+    healthy = compute_advantage(_aligned(), AdvantageEstimator.GRPO, norm_adv_by_std_in_grpo=False)
+    assert not np.array(healthy.non_tensor_batch[ms.BASELINE_GUARDED_KEY], dtype=bool).any()
+
+
+# ---------------------------------------------------------------- prompt-mean over multi-segment rows
+def _graded(**kw) -> DataProto:
+    batch, _ = ms.pad_rows(_aligned(**kw), divisor=64, pad_token_id=PAD, eos_token_id=EOS)
+    return ms.compute_episode_grpo_advantage(batch, norm_adv_by_std_in_grpo=False, mask_zero_adv=True)
+
+
+def test_prompt_mean_weights_over_segments():
+    batch = _graded()
+    m = ms.apply_token_channels(batch, {}, prompt_mean=True)
+    w = batch.batch[ms.PROMPT_WEIGHTS_KEY]
+    mask = batch.batch["response_mask"]
+    counts = mask.sum(-1)
+    uid = batch.non_tensor_batch["uid"]
+    assert m["loss/prompt_mean_weight_sum"] == pytest.approx(1.0)
+    assert m["loss/prompt_mean_prompt_count"] == 3.0  # task1 is uniform (masked), padding has no tokens
+    assert float((w * counts).sum()) == pytest.approx(1.0)
+    pad = torch.from_numpy(ms._flag(batch, ms.PADDING_KEY))
+    assert (w[pad] == 0).all() and (w[torch.from_numpy(np.array([u == "task1" for u in uid]))] == 0).all()
+    for t in (0, 2, 3):
+        sel = torch.from_numpy(np.array([u == f"task{t}" for u in uid]))
+        assert float((w[sel] * counts[sel]).sum()) == pytest.approx(1 / 3)  # every task weighs 1/G
+    # the loss is the mean over tasks of each task's token mean
+    loss_mat = torch.rand_like(mask, dtype=torch.float64)
+    ref = torch.stack(
+        [
+            loss_mat[sel][mask[sel].bool()].mean()
+            for sel in (torch.from_numpy(np.array([u == f"task{t}" for u in uid])) for t in (0, 2, 3))
+        ]
+    ).mean()
+    torch.testing.assert_close(agg_loss(loss_mat, mask, "prompt-mean", prompt_loss_weights=w), ref)
+
+
+def test_prompt_mean_config_check_and_finalize():
+    cfg = _trainer_cfg()
+    cfg.actor_rollout_ref.actor.loss_agg_mode = "prompt-mean"
+    cfg.data.train_batch_size, cfg.actor_rollout_ref.actor.ppo_mini_batch_size = 8, 8
+    stub = SimpleNamespace(config=cfg)
+    stub._prompt_mean = lambda: RayPPOTrainer._prompt_mean(stub)
+    stub._multi_segment_update_count = lambda: RayPPOTrainer._multi_segment_update_count(stub)
+    RayPPOTrainer._check_prompt_mean_config(stub)  # one update per step: fine
+    cfg.actor_rollout_ref.actor.ppo_mini_batch_size = 4
+    with pytest.raises(ValueError, match="one optimizer update per step"):
+        RayPPOTrainer._check_prompt_mean_config(stub)
+    cfg.actor_rollout_ref.actor.ppo_mini_batch_size = 8
+    cfg.algorithm.multi_segment.update_count = "rows"
+    with pytest.raises(ValueError, match="update_count=fixed"):
+        RayPPOTrainer._check_prompt_mean_config(stub)
+    cfg.algorithm.multi_segment.update_count = "fixed"
+    batch = _graded()
+    m = RayPPOTrainer._finalize_loss_inputs(stub, batch)
+    assert ms.PROMPT_WEIGHTS_KEY in batch.batch.keys() and m["loss/prompt_mean_weight_sum"] == pytest.approx(1.0)
+    # token-mean: no weights
+    cfg.actor_rollout_ref.actor.loss_agg_mode = "token-mean"
+    batch = _graded()
+    assert RayPPOTrainer._finalize_loss_inputs(stub, batch) == {}
+    assert ms.PROMPT_WEIGHTS_KEY not in batch.batch.keys()
+
+
+def test_prompt_mean_actor_config_accepts_bypass_ppo_clip_only():
+    cfg = _trainer_cfg()
+    cfg.actor_rollout_ref.actor.loss_agg_mode = "prompt-mean"
+    RayPPOTrainer._apply_bypass_mode_to_actor_config(SimpleNamespace(config=cfg))
+    info = _worker_info(cfg)  # the worker's ActorConfig conversion runs the validation
+    assert info["loss_mode"] == "bypass_mode" and info["loss_agg_mode"] == "prompt-mean"
+    bad = _trainer_cfg()
+    bad.actor_rollout_ref.actor.loss_agg_mode = "prompt-mean"
+    bad.algorithm.rollout_correction.loss_type = "reinforce"
+    RayPPOTrainer._apply_bypass_mode_to_actor_config(SimpleNamespace(config=bad))
+    with pytest.raises(Exception, match="prompt-mean requires the vanilla PPO policy loss"):  # hydra wraps it
+        _worker_info(bad)
+
+
+# ---------------------------------------------------------------- token channels (tool_error / repetition)
+def _with_spans(batch: DataProto) -> DataProto:
+    """Spans on the first row of every 3rd row index (row 0 included, so pad_rows copies them onto padding rows)."""
+    n = len(batch)
+    te_spans = np.empty(n, dtype=object)
+    te_kinds = np.empty(n, dtype=object)
+    rep_spans = np.empty(n, dtype=object)
+    for i in range(n):
+        if i % 3 == 0:
+            te_spans[i], te_kinds[i] = [[0, 1], [1, 2], [3, 4]], ["format", "execution", "environment"]
+            rep_spans[i] = [[0, 2]]
+        else:
+            te_spans[i], te_kinds[i], rep_spans[i] = [], [], []
+    batch.non_tensor_batch[ms.TOOL_ERROR_SPANS_KEY] = te_spans
+    batch.non_tensor_batch[ms.TOOL_ERROR_KINDS_KEY] = te_kinds
+    batch.non_tensor_batch[ms.REPETITION_SPANS_KEY] = rep_spans
+    return batch
+
+
+def _graded_with_spans() -> DataProto:
+    batch, _ = ms.pad_rows(_with_spans(_aligned()), divisor=64, pad_token_id=PAD, eos_token_id=EOS)
+    return ms.compute_episode_grpo_advantage(batch, norm_adv_by_std_in_grpo=False, mask_zero_adv=True)
+
+
+def test_span_hits_skip_padding_and_filter_kinds():
+    batch = _graded_with_spans()
+    pad = ms._flag(batch, ms.PADDING_KEY)
+    assert pad.any() and batch.non_tensor_batch[ms.TOOL_ERROR_SPANS_KEY][np.flatnonzero(pad)[0]]  # copied from row 0
+    hits, n = ms._span_hits(batch, ms.TOOL_ERROR_SPANS_KEY, ms.TOOL_ERROR_KINDS_KEY, None)
+    real_marked = [i for i in range(len(batch)) if not pad[i] and i % 3 == 0]
+    assert n == 3 * len(real_marked) and not hits[torch.from_numpy(pad)].any()
+    # the default kinds leave "environment" (an image artifact) unmarked
+    _, n_default = ms._span_hits(batch, ms.TOOL_ERROR_SPANS_KEY, ms.TOOL_ERROR_KINDS_KEY, {"format", "execution"})
+    assert n_default == 2 * len(real_marked)
+    fmt, n_fmt = ms._span_hits(batch, ms.TOOL_ERROR_SPANS_KEY, ms.TOOL_ERROR_KINDS_KEY, {"format"})
+    assert n_fmt == len(real_marked) and fmt[real_marked[0]].tolist()[:2] == [True, False]
+    missing, n_missing = ms._span_hits(batch, "no_such_column", None, None)
+    assert n_missing == 0 and not missing.any()
+
+
+def test_monitor_leaves_advantages_untouched():
+    batch = _graded_with_spans()
+    before_adv, before_mask = batch.batch["advantages"].clone(), batch.batch["response_mask"].clone()
+    cfg = {
+        "tool_error": {"strategy": "monitor", "kinds": ["format", "execution"]},
+        "repetition": {"strategy": "monitor"},
+    }
+    m = ms.apply_token_channels(batch, cfg, prompt_mean=False)
+    assert torch.equal(batch.batch["advantages"], before_adv) and torch.equal(batch.batch["response_mask"], before_mask)
+    pad = ms._flag(batch, ms.PADDING_KEY)
+    n_marked = sum(1 for i in range(len(batch)) if not pad[i] and i % 3 == 0)
+    assert m["multi_segment/tool_error/spans"] == 2 * n_marked  # kinds [format, execution]: environment not marked
+    assert m["multi_segment/tool_error/format/spans"] == n_marked == m["multi_segment/tool_error/execution/spans"]
+    assert m["multi_segment/tool_error/environment/spans"] == n_marked  # but still counted per kind
+    assert m["multi_segment/repetition/spans"] == n_marked
+    assert m["multi_segment/tool_error/hit_rows"] == n_marked
+    assert m["multi_segment/tool_error/trained_hit_tokens"] <= m["multi_segment/tool_error/hit_tokens"]
+    assert 0 < m["multi_segment/tool_error/hit_episode_frac"] <= 1
+    # off: no metrics, nothing touched
+    assert ms.apply_token_channels(_graded_with_spans(), {}, prompt_mean=False) == {}
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        ms.apply_token_channels(_graded_with_spans(), {"tool_error": {"strategy": "bogus"}}, prompt_mean=False)
+    # an unquoted YAML `off` (False) means off
+    assert ms.apply_token_channels(_graded_with_spans(), {"tool_error": {"strategy": False}}, prompt_mean=False) == {}
+
+
+def test_mask_strategy_removes_marked_tokens_from_the_loss():
+    batch = _graded_with_spans()
+    before = batch.batch["response_mask"].clone()
+    hits, _ = ms._span_hits(batch, ms.REPETITION_SPANS_KEY, None, None)
+    m = ms.apply_token_channels(batch, {"repetition": {"strategy": "mask"}}, prompt_mean=True)
+    trained = hits & before.bool()
+    assert m["multi_segment/repetition/masked_tokens"] == float(trained.sum())
+    assert (batch.batch["response_mask"][trained] == 0).all()
+    assert (batch.batch["advantages"][trained] == 0).all()
+    # the prompt-mean weights are computed on the mask AFTER the channel
+    weights, counts = batch.batch[ms.PROMPT_WEIGHTS_KEY], batch.batch["response_mask"].sum(-1)
+    assert float((weights * counts).sum()) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("prompt_mean", [False, True])
+def test_adv_signed_conserves_each_signs_mass(prompt_mean):
+    batch = _graded_with_spans()
+    adv0 = batch.batch["advantages"].clone()
+    cfg = {
+        "tool_error": {
+            "strategy": "adv_signed",
+            "kappa": 2.0,
+            "min_scale": 0.01,
+            "max_scale": 100.0,
+            "kinds": ["format", "execution"],
+        }
+    }
+    m = ms.apply_token_channels(batch, cfg, prompt_mean=prompt_mean)
+    adv1 = batch.batch["advantages"]
+    mask = batch.batch["response_mask"].bool()
+    w = (
+        batch.batch[ms.PROMPT_WEIGHTS_KEY].unsqueeze(-1).expand_as(adv0)
+        if prompt_mean
+        else torch.ones_like(adv0, dtype=torch.float64)
+    )
+    for sign in (1, -1):
+        sel = mask & (torch.sign(adv0) == sign)
+        torch.testing.assert_close(
+            (adv1.double() * w)[sel].sum(), (adv0.double() * w)[sel].sum(), rtol=1e-5, atol=1e-8
+        )
+    hits, _ = ms._span_hits(batch, ms.TOOL_ERROR_SPANS_KEY, ms.TOOL_ERROR_KINDS_KEY, {"format", "execution"})
+    pos_hit = hits & mask & (adv0 > 0)
+    neg_hit = hits & mask & (adv0 < 0)
+    assert pos_hit.any() and neg_hit.any()
+    assert (adv1[pos_hit] == 0).all()
+    torch.testing.assert_close(adv1[neg_hit], 2.0 * adv0[neg_hit])
+    torch.testing.assert_close(batch.batch["returns"], adv1)
+    assert any(k.startswith("penalty/signed") for k in m)
+
+
+# ---------------------------------------------------------------- pass rates, depth mass, pass-rate dump
+def test_pass_rate_and_depth_metrics():
+    batch = _graded()
+    m = ms.compute_multi_segment_metrics(batch)
+    rates = [np.mean(r) for r in REWARDS]
+    assert m["multi_segment/passrate/all_fail_frac"] == pytest.approx(np.mean([r == 0 for r in rates]))
+    assert m["multi_segment/passrate/all_solved_frac"] == 0.0
+    assert m["multi_segment/passrate/mixed_frac"] == pytest.approx(np.mean([0 < r < 1 for r in rates]))
+    assert sum(m[f"multi_segment/passrate/hist_{b}"] for b in ms.PASS_RATE_BINS) == pytest.approx(1.0)
+    buckets = [b for b, _, _ in ms.DEPTH_BUCKETS]
+    assert sum(m[f"multi_segment/depth/{b}/tokens"] for b in buckets) == m["multi_segment/trained_tokens"]
+    for mass in ("pos_mass", "neg_mass"):
+        total = sum(m[f"multi_segment/depth/{b}/{mass}"] for b in buckets)
+        assert total == pytest.approx(m[f"multi_segment/depth/{mass}"])
+    # uniform weights (token-mean): mass = sum(adv) / trained tokens
+    adv = batch.batch["advantages"]
+    assert m["multi_segment/depth/pos_mass"] - m["multi_segment/depth/neg_mass"] == pytest.approx(
+        float(adv.sum()) / float(batch.batch["response_mask"].sum())
+    )
+    # prompt-mean: the same mass under the prompt weights
+    ms.set_prompt_loss_weights(batch)
+    mp = ms.compute_multi_segment_metrics(batch)
+    w = batch.batch[ms.PROMPT_WEIGHTS_KEY].unsqueeze(-1)
+    net = mp["multi_segment/depth/pos_mass"] - mp["multi_segment/depth/neg_mass"]
+    assert net == pytest.approx(float((adv * w).sum()))
+    # depth falls back to segment_index when trace_index is absent: deep segments land in later buckets
+    assert m["multi_segment/depth/seg4_7/tokens"] > 0 and m["multi_segment/depth/seg8p/tokens"] == 0.0
+
+
+def test_pass_rates_exclude_out_of_baseline_episodes(tmp_path):
+    batch = _graded(flags=_lone_solve_flags())
+    m = ms.compute_multi_segment_metrics(batch)
+    # task 2 now has one in-baseline episode, solved: pass rate 1
+    assert m["multi_segment/passrate/all_solved_frac"] == pytest.approx(1 / 4)
+    path = ms.dump_pass_rates(batch, str(tmp_path), step=7)
+    rows = {r["uid"]: r for r in map(json.loads, Path(path).read_text().splitlines())}
+    assert path.endswith("pass_rates_step_7.jsonl") and set(rows) == {f"task{t}" for t in range(4)}
+    assert rows["task2"]["episodes"] == 1 and rows["task2"]["solved"] == 1
+    assert rows["task0"]["episodes"] == N and rows["task0"]["solved"] == sum(REWARDS[0])
+
+
+def test_dump_rows_carries_guard_spans_and_weights(tmp_path):
+    batch = _graded_with_spans()
+    ms.set_prompt_loss_weights(batch)
+    rows = [json.loads(line) for line in Path(ms.dump_rows(batch, str(tmp_path), step=1)).read_text().splitlines()]
+    assert all(ms.BASELINE_GUARDED_KEY in r and "prompt_loss_weight" in r for r in rows)
+    assert rows[0][ms.TOOL_ERROR_SPANS_KEY] == [[0, 1], [1, 2], [3, 4]]
+    assert rows[0][ms.TOOL_ERROR_KINDS_KEY] == ["format", "execution", "environment"]
+
+
+# ---------------------------------------------------------------- the agent loops get the generation step
+def test_generate_sequences_passes_global_steps_to_agent_loops():
+    import asyncio
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+
+    seen = []
+
+    async def _run(sampling_params, trajectory, *, trace=True, **kwargs):
+        seen.append(kwargs)
+        return SimpleNamespace()
+
+    worker = SimpleNamespace(
+        rollout_config=OmegaConf.create(
+            {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "calculate_log_probs": True,
+                "agent": {"default_agent_loop": "polar"},
+                "val_kwargs": {"top_p": 1.0, "top_k": -1, "temperature": 1.0},
+            }
+        ),
+        _run_agent_loop=_run,
+        _postprocess=lambda outputs, **kw: outputs,
+    )
+    batch = DataProto.from_dict(
+        tensors={"dummy": torch.zeros(2, 1)}, non_tensors={"uid": np.array(["a", "b"], dtype=object)}
+    )
+    batch.meta_info["global_steps"] = 7
+    asyncio.run(AgentLoopWorker.generate_sequences(worker, batch))
+    assert [k["global_steps"] for k in seen] == [7, 7] and seen[0]["agent_name"] == "polar"
+    seen.clear()
+    del batch.meta_info["global_steps"]
+    asyncio.run(AgentLoopWorker.generate_sequences(worker, batch))
+    assert "global_steps" not in seen[0]

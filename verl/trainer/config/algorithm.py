@@ -710,7 +710,9 @@ class AlgoConfig(BaseConfig):
         kl_ctrl (KLControlConfig): KL control configuration.
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
-        multi_segment (dict[str, Any]): Multi-segment episode settings (update_count, dump_dir), see
+        multi_segment (dict[str, Any]): Multi-segment episode settings: update_count, dump_dir, mask_zero_adv,
+            min_baseline_episodes, tool_error / repetition (token channels: strategy, kappa, min_scale, max_scale,
+            kinds) and cost_penalty; defaults and meanings in ppo_trainer.yaml, code in
             verl/trainer/ppo/multi_segment.py.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.

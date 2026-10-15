@@ -220,10 +220,13 @@ def compute_advantage(
             raise NotImplementedError(f"multi-segment batches support adv_estimator=grpo only, got {adv_estimator}")
         ms_cfg = (config.get("multi_segment") if config is not None else None) or {}
         data = multi_segment.apply_episode_cost_penalty(data, ms_cfg.get("cost_penalty"), norm_adv_by_std_in_grpo)
+        # token channels (tool_error / repetition) and the prompt-mean weights come after this, in the trainer's
+        # _finalize_loss_inputs: they need the actor config (loss_agg_mode), which compute_advantage does not see
         return multi_segment.compute_episode_grpo_advantage(
             data,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             mask_zero_adv=bool(ms_cfg.get("mask_zero_adv", True)),
+            min_baseline_episodes=int(ms_cfg.get("min_baseline_episodes", 2)),
         )
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
@@ -1366,6 +1369,33 @@ class RayPPOTrainer:
     def _multi_segment_update_count(self) -> str:
         return (self.config.algorithm.get("multi_segment") or {}).get("update_count", "fixed")
 
+    def _prompt_mean(self) -> bool:
+        return self.config.actor_rollout_ref.actor.get("loss_agg_mode", "token-mean") == "prompt-mean"
+
+    def _check_prompt_mean_config(self) -> None:
+        """prompt-mean weights are computed once over the whole sampled batch: it must be ONE optimizer mini-batch
+        (MiMo's hard requirement), or every mini-batch but the last would train on weights that do not sum to 1."""
+        if not self._prompt_mean():
+            return
+        actor = self.config.actor_rollout_ref.actor
+        if self.config.data.train_batch_size != actor.ppo_mini_batch_size:
+            raise ValueError(
+                "actor.loss_agg_mode=prompt-mean needs one optimizer update per step: data.train_batch_size "
+                f"({self.config.data.train_batch_size}) must equal actor.ppo_mini_batch_size "
+                f"({actor.ppo_mini_batch_size})"
+            )
+        if self.config.algorithm.get("multi_segment") and self._multi_segment_update_count() != "fixed":
+            raise ValueError("actor.loss_agg_mode=prompt-mean needs algorithm.multi_segment.update_count=fixed")
+
+    def _finalize_loss_inputs(self, batch: DataProto) -> dict[str, float]:
+        """After compute_advantage: the multi-segment token channels, then the prompt-mean weights; returns metrics."""
+        if multi_segment.is_multi_segment(batch):
+            ms_cfg = self.config.algorithm.get("multi_segment") or {}
+            return multi_segment.apply_token_channels(batch, ms_cfg, prompt_mean=self._prompt_mean())
+        if self._prompt_mean():
+            return multi_segment.set_prompt_loss_weights(batch)
+        return {}
+
     def _pad_multi_segment_batch(self, batch: DataProto, metrics: dict) -> DataProto:
         """Pad a multi-segment batch with neutral rows to the row multiple the dispatch and the update need."""
         actor = self.config.actor_rollout_ref.actor
@@ -1394,6 +1424,11 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        prompt_mean = self.config.actor_rollout_ref.actor.get("loss_agg_mode", "token-mean") == "prompt-mean"
+        if prompt_mean and multi_segment.PROMPT_WEIGHTS_KEY not in batch.batch.keys():
+            raise ValueError(
+                "actor.loss_agg_mode=prompt-mean but the batch has no prompt_loss_weights (_finalize_loss_inputs)"
+            )
         # update actor
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
@@ -1662,7 +1697,10 @@ class RayPPOTrainer:
                             entropy_agg = agg_loss(
                                 loss_mat=entropys,
                                 loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
+                                # a metric only: prompt-mean weights don't exist before the advantage, use token-mean
+                                loss_agg_mode="token-mean"
+                                if actor_config.loss_agg_mode == "prompt-mean"
+                                else actor_config.loss_agg_mode,
                                 loss_scale_factor=actor_config.loss_scale_factor,
                             )
                             old_log_prob_metrics = {
@@ -1745,6 +1783,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        metrics.update(self._finalize_loss_inputs(batch))
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
