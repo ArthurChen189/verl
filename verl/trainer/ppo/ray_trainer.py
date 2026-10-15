@@ -228,6 +228,15 @@ def compute_advantage(
             mask_zero_adv=bool(ms_cfg.get("mask_zero_adv", True)),
             min_baseline_episodes=int(ms_cfg.get("min_baseline_episodes", 2)),
         )
+    # the cost penalty only exists on the multi-segment path: a single-trace run that enables it must not silently
+    # train without it
+    ms_cfg = (config.get("multi_segment") if config is not None else None) or {}
+    if (ms_cfg.get("cost_penalty") or {}).get("enable", False):
+        raise ValueError(
+            "algorithm.multi_segment.cost_penalty.enable=true, but this batch is not multi-segment (no episode_id): "
+            "the penalty runs only on multi-segment episodes (an agent loop returning one row per segment, e.g. "
+            "TRACE_SELECTION=all); disable it or switch the agent loop"
+        )
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -1645,6 +1654,13 @@ class RayPPOTrainer:
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if multi_segment.SOURCE_INDEX_KEY in gen_batch_output.non_tensor_batch:
+                        # several rows per sample: the 1:1 union below would misalign (or assert on the size)
+                        raise NotImplementedError(
+                            "RayPPOTrainer.fit does not support multi-segment agent loops (an agent loop returned "
+                            "several outputs per sample); run them with the separation or one-step-off trainer "
+                            "(verl.experimental.one_step_off_policy.main_ppo), which align rows to episodes"
+                        )
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():

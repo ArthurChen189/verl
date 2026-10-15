@@ -64,9 +64,18 @@ With ``apply_to: success`` (the default) only episodes whose raw score is above 
 policy is never rewarded for failing cheaply (giving up early), a solve always beats a failure, and among a group's
 solves the cheaper ones get the larger advantage (all-solved groups, which carry no gradient otherwise, now train on
 cost). The penalty goes into a copy of ``token_level_rewards`` only: ``token_level_scores`` (and so
-``multi_segment/success_rate``, ``critic/score/*`` and validation) stay the raw outcome. Requires Dr.GRPO
+``multi_segment/success_rate``, ``critic/score/*`` and validation) stay the raw outcome; "solved" is judged on
+``token_level_scores`` too, so a KL-in-reward term can never move an episode across the threshold. Requires Dr.GRPO
 (``norm_adv_by_std_in_grpo: false``): with std normalisation the small cost differences inside an all-solved group
 would be blown up to unit-scale advantages.
+  anchor: ``calibrated`` (default) charges C(x) with the x above, the same anchor on every task, so cost is compared
+          across tasks. ``group_quantile`` (MiMo's shape, its length_penalty.py and paper Eq. 4) measures x against the
+          group's own solves: x_a = the ``anchor_quantile`` of the solved in-baseline episodes' x in the task's group,
+          and an episode pays lambda * C(x / x_a - 1) only when x > x_a (lam1 is then the penalty at twice the anchor).
+          A task that always needs many turns is not charged for being hard; a group with one solve has x_a = that
+          solve and pays nothing.
+  min_pass_rate: a group whose pass rate (solved / in-baseline episodes) is <= it pays nothing (MiMo's gate: protects
+          exploration on tasks the policy rarely solves); 0 (default) = no gate.
 """
 
 from __future__ import annotations
@@ -101,6 +110,9 @@ REPETITION_SPANS_KEY = "repetition_spans"
 CHANNEL_STRATEGIES = ("off", "monitor", "mask", "adv_signed")
 COST_PENALTY_KEY = "episode_cost_penalty"
 COST_X_KEY = "episode_cost_x"
+COST_ANCHOR_KEY = "episode_cost_anchor"  # group_quantile: the x anchor of the row's group (None: no anchor)
+COST_GATED_KEY = "cost_penalty_gated"  # the row's group failed the min_pass_rate gate: nobody in it pays
+COST_ANCHORS = ("calibrated", "group_quantile")
 # per-episode cost columns emitted by the agent loop (identical on every row of an episode); the first six are the
 # components of the cost penalty's x
 COST_COLUMNS = (
@@ -271,8 +283,9 @@ def apply_episode_cost_penalty(data: DataProto, cfg: dict | None, norm_adv_by_st
 
     cfg (algorithm.multi_segment.cost_penalty): enable; weights {component: w} and norms {component: m} (x = sum w c / m)
     or, with no weights, signal + scale (x = episode_<signal> / scale); k, q (the shape of C); lam1 (the penalty at
-    x = 1); max_penalty (< 1); apply_to (success | all); success_threshold. Writes ``episode_cost_x`` and
-    ``episode_cost_penalty`` on every real row (0 on padding). No-op unless enabled."""
+    x = 1); max_penalty (< 1); apply_to (success | all); success_threshold; anchor (calibrated | group_quantile),
+    anchor_quantile, min_pass_rate (module docstring). Writes ``episode_cost_x``, ``episode_cost_penalty`` (0 on
+    padding), ``episode_cost_anchor`` and ``cost_penalty_gated`` on every row. No-op unless enabled."""
     if not cfg or not cfg.get("enable", False):
         return data
     if norm_adv_by_std_in_grpo:
@@ -286,6 +299,14 @@ def apply_episode_cost_penalty(data: DataProto, cfg: dict | None, norm_adv_by_st
     k, q = float(cfg.get("k", 2.0)), float(cfg.get("q", 1.0))
     lam1, cap = float(cfg.get("lam1", 0.05)), float(cfg.get("max_penalty", 0.5))
     apply_to, threshold = str(cfg.get("apply_to", "success")), float(cfg.get("success_threshold", 0.5))
+    anchor, anchor_q = str(cfg.get("anchor", "calibrated")), float(cfg.get("anchor_quantile", 0.5))
+    min_pass = float(cfg.get("min_pass_rate", 0.0))
+    if anchor not in COST_ANCHORS:
+        raise ValueError(f"cost_penalty.anchor must be one of {COST_ANCHORS}, got {anchor!r}")
+    if not 0.0 <= anchor_q <= 1.0:
+        raise ValueError(f"cost_penalty.anchor_quantile must be in [0, 1], got {anchor_q}")
+    if not 0.0 <= min_pass < 1.0:
+        raise ValueError(f"cost_penalty.min_pass_rate must be in [0, 1) (0 = no gate), got {min_pass}")
     if k <= 0 or q < 0:
         raise ValueError(f"cost_penalty needs k > 0 and q >= 0, got k={k} q={q}")
     if lam1 < 0 or not 0.0 <= cap < 1.0:
@@ -308,17 +329,51 @@ def apply_episode_cost_penalty(data: DataProto, cfg: dict | None, norm_adv_by_st
     nt = data.non_tensor_batch
     lam = lam1 / cost_curve(1.0, k, q)
     rewards = data.batch["token_level_rewards"].clone()  # it aliases token_level_scores: keep the raw outcome intact
-    row_score = rewards.sum(dim=-1).to(torch.float64)
+    # "solved" is the RAW outcome: token_level_rewards would include a KL penalty under use_kl_in_reward
+    raw = data.batch["token_level_scores"] if "token_level_scores" in data.batch.keys() else rewards
+    row_score = raw.sum(dim=-1).to(torch.float64)
     prompt_len = data.batch["prompts"].shape[-1]
     resp_attn = data.batch["attention_mask"][:, prompt_len:]
     final = _flag(data, "is_final_segment")
+    excl_base = _flag(data, EXCLUDE_BASELINE_KEY)
     penalty = np.zeros(len(data), dtype=np.float64)
     xs = np.array([None] * len(data), dtype=object)
-    for rows in _episode_rows(data).values():
-        x = _cost_x(nt, rows[0], weights, norms, signal, scale)
-        xs[rows] = x
-        if x is None or (apply_to == "success" and float(row_score[rows].sum()) <= threshold):
+    anchors = np.array([None] * len(data), dtype=object)
+    gated_rows = np.zeros(len(data), dtype=bool)
+    ep_rows = _episode_rows(data)
+    ep_x = {ep: _cost_x(nt, rows[0], weights, norms, signal, scale) for ep, rows in ep_rows.items()}
+    ep_solved = {ep: float(row_score[rows].sum()) > threshold for ep, rows in ep_rows.items()}
+    ep_uid = {ep: nt["uid"][rows[0]] for ep, rows in ep_rows.items()}
+    # per task, over its in-baseline episodes (as the GRPO baseline): the pass rate (the gate) and the solves' x
+    # (the anchor)
+    n_base: dict[Any, int] = defaultdict(int)
+    n_solved: dict[Any, int] = defaultdict(int)
+    solved_x: dict[Any, list[float]] = defaultdict(list)
+    for ep, rows in ep_rows.items():
+        if excl_base[rows].any():
             continue
+        n_base[ep_uid[ep]] += 1
+        if ep_solved[ep]:
+            n_solved[ep_uid[ep]] += 1
+            if ep_x[ep] is not None:
+                solved_x[ep_uid[ep]].append(ep_x[ep])
+    gated = {u for u, n in n_base.items() if min_pass > 0.0 and n_solved[u] / n <= min_pass}
+    x_anchor = {u: float(np.percentile(v, anchor_q * 100.0)) for u, v in solved_x.items() if v}
+    for ep, rows in ep_rows.items():
+        x, u = ep_x[ep], ep_uid[ep]
+        xs[rows] = x
+        if anchor == "group_quantile":
+            anchors[rows] = x_anchor.get(u)
+        if u in gated:
+            gated_rows[rows] = True
+            continue
+        if x is None or (apply_to == "success" and not ep_solved[ep]):
+            continue
+        if anchor == "group_quantile":
+            xa = x_anchor.get(u)
+            if xa is None or xa <= 0.0 or x <= xa:  # no solve to anchor on, or not costlier than the anchor
+                continue
+            x = x / xa - 1.0  # relative excess over the anchor: C(0) = 0 at the anchor, lam1 at twice it
         p = min(lam * cost_curve(x, k, q), cap)
         if p <= 0.0:
             continue
@@ -330,6 +385,8 @@ def apply_episode_cost_penalty(data: DataProto, cfg: dict | None, norm_adv_by_st
     data.batch["token_level_rewards"] = rewards
     data.non_tensor_batch[COST_PENALTY_KEY] = penalty.astype(object)
     data.non_tensor_batch[COST_X_KEY] = xs
+    data.non_tensor_batch[COST_ANCHOR_KEY] = anchors
+    data.non_tensor_batch[COST_GATED_KEY] = gated_rows.astype(object)
     return data
 
 
@@ -614,7 +671,10 @@ def compute_multi_segment_metrics(batch: DataProto, success_threshold: float = 0
                                 [.75,1) | p1)
       depth/<bucket>/*          advantage mass (sum of advantage x per-token loss weight; prompt-mean weights if set,
                                 else 1 / trained tokens) and trained tokens by chronological segment (trace_index 0,
-                                1-2, 3-6, 7+): where the positive and negative gradient comes from"""
+                                1-2, 3-6, 7+): where the positive and negative gradient comes from
+      cost_penalty/gated_groups tasks the min_pass_rate gate exempted from the cost penalty this step
+      cost_penalty/anchored_groups, cost_penalty/anchor_mean  group_quantile: tasks with an anchor (>= 1 solve with a
+                                cost) and the mean anchor x over them"""
     nt = batch.non_tensor_batch
     pad = _flag(batch, PADDING_KEY)
     real = ~pad
@@ -697,6 +757,18 @@ def compute_multi_segment_metrics(batch: DataProto, success_threshold: float = 0
                 sel = [float(v) for ep, v in vals.items() if ep in ep_reward and keep(ep_reward[ep])]
                 if sel:
                     m[f"multi_segment/{name}/{label}_mean"] = float(np.mean(sel))
+    # cost-penalty anchor / gate, per task (group): the gate's groups and the group_quantile anchors
+    uid_col = nt.get("uid")
+    if uid_col is not None:
+        gated_col, anchor_col = nt.get(COST_GATED_KEY), nt.get(COST_ANCHOR_KEY)
+        first_rows = [rows[0] for rows in ep_rows.values()]
+        if gated_col is not None:
+            m["multi_segment/cost_penalty/gated_groups"] = float(len({uid_col[i] for i in first_rows if gated_col[i]}))
+        if anchor_col is not None:
+            by_uid = {uid_col[i]: float(anchor_col[i]) for i in first_rows if anchor_col[i] is not None}
+            if by_uid:
+                m["multi_segment/cost_penalty/anchored_groups"] = float(len(by_uid))
+                m["multi_segment/cost_penalty/anchor_mean"] = float(np.mean(list(by_uid.values())))
     capped = nt.get("episode_capped")
     if capped is not None:
         m["multi_segment/capped_episode_rate"] = sum(bool(capped[rows[0]]) for rows in ep_rows.values()) / n_ep
@@ -802,6 +874,8 @@ def dump_rows(batch: DataProto, dump_dir: str, step: int) -> str:
             EPISODE_ADV_KEY,
             COST_PENALTY_KEY,
             COST_X_KEY,
+            COST_ANCHOR_KEY,
+            COST_GATED_KEY,
             *COST_COLUMNS,
             "episode_capped",
             "polar_session_id",

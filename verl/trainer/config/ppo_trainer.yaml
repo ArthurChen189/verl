@@ -231,6 +231,16 @@ algorithm:
       # Raw episode score above which an episode counts as solved
       success_threshold: 0.5
 
+      # calibrated (charge C(x), the same anchor on every task) | group_quantile (MiMo's shape: x measured against the
+      # anchor_quantile of the group's solved x; only solves costlier than that anchor pay, lam1 at twice the anchor)
+      anchor: calibrated
+
+      # Quantile of the group's solved x used as the anchor (group_quantile)
+      anchor_quantile: 0.5
+
+      # Pass-rate gate: a group whose pass rate is <= this pays nothing (protects exploration on hard tasks); 0 = off
+      min_pass_rate: 0.0
+
 # config for the trainer
 trainer:
 

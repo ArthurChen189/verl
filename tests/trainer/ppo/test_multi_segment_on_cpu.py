@@ -835,6 +835,90 @@ def test_cost_penalty_skips_padding_and_reaches_metrics_and_dump(tmp_path):
     assert row["episode_cost_usd"] == pytest.approx(_ep_cost(0, 0)) and ms.COST_PENALTY_KEY in row and ms.COST_X_KEY in row
 
 
+def _x(t: int, e: int) -> float:
+    return _ep_cost(t, e) / CP["scale"]
+
+
+def test_cost_penalty_group_quantile_anchor_charges_only_the_groups_costly_solves():
+    cfg = {**CP, "anchor": "group_quantile", "anchor_quantile": 0.5}
+    out = ms.apply_episode_cost_penalty(_with_cost(_aligned()), cfg, norm_adv_by_std_in_grpo=False)
+    rows, pen = _episode_rows(out), out.non_tensor_batch[ms.COST_PENALTY_KEY]
+    anchor = out.non_tensor_batch[ms.COST_ANCHOR_KEY]
+    for t in range(4):
+        solves = [e for e in range(N) if REWARDS[t][e]]
+        xa = float(np.percentile([_x(t, e) for e in solves], 50)) if solves else None
+        for e in range(N):
+            i = rows[f"task{t}#{t * N + e}"][0]
+            assert anchor[i] == (pytest.approx(xa) if xa is not None else None)
+            charged = REWARDS[t][e] and _x(t, e) > xa
+            want = _want(_x(t, e) / xa - 1.0) if charged else 0.0  # C of the relative excess: 0 at the anchor
+            assert pen[i] == pytest.approx(want)
+    # task 3's five solves: the two above the median pay, the median and below do not; task 2's lone solve IS its anchor
+    assert sum(float(pen[rows[f"task3#{24 + e}"][0]]) > 0 for e in range(N)) == 2
+    assert float(pen[rows["task2#16"][0]]) == 0.0
+    m = ms.compute_multi_segment_metrics(out)
+    assert m["multi_segment/cost_penalty/anchored_groups"] == 3.0  # tasks 0, 2, 3 have solves
+    assert m["multi_segment/cost_penalty/anchor_mean"] == pytest.approx(
+        np.mean([np.percentile([_x(t, e) for e in range(N) if REWARDS[t][e]], 50) for t in (0, 2, 3)])
+    )
+
+
+def test_cost_penalty_anchor_ignores_out_of_baseline_solves():
+    # task 3's cheapest solve (e=0) leaves the baseline: the anchor is the median of the other four
+    flags = {(3, 0): {"exclude_from_baseline": True}}
+    cfg = {**CP, "anchor": "group_quantile"}
+    out = ms.apply_episode_cost_penalty(_with_cost(_aligned(flags=flags)), cfg, norm_adv_by_std_in_grpo=False)
+    i = _episode_rows(out)["task3#24"][0]
+    want = np.percentile([_x(3, e) for e in (2, 3, 5, 7)], 50)
+    assert out.non_tensor_batch[ms.COST_ANCHOR_KEY][i] == pytest.approx(want)
+
+
+def test_cost_penalty_min_pass_rate_gate():
+    cfg = {**CP, "min_pass_rate": 0.3}  # pass rates: task0 2/8, task1 0, task2 1/8 (gated), task3 5/8 (pays)
+    out = ms.apply_episode_cost_penalty(_with_cost(_aligned()), cfg, norm_adv_by_std_in_grpo=False)
+    rows, pen = _episode_rows(out), out.non_tensor_batch[ms.COST_PENALTY_KEY]
+    gated = out.non_tensor_batch[ms.COST_GATED_KEY]
+    for t in range(4):
+        for e in range(N):
+            i = rows[f"task{t}#{t * N + e}"][0]
+            assert bool(gated[i]) == (t != 3)
+            assert pen[i] == pytest.approx(_want(_x(t, e)) if t == 3 and REWARDS[t][e] else 0.0)
+    assert ms.compute_multi_segment_metrics(out)["multi_segment/cost_penalty/gated_groups"] == 3.0
+    # MiMo's <= semantics: a pass rate equal to the gate is gated too; 0 (the default) gates nothing
+    eq = ms.apply_episode_cost_penalty(_with_cost(_aligned()), {**CP, "min_pass_rate": 0.25}, False)
+    assert bool(eq.non_tensor_batch[ms.COST_GATED_KEY][_episode_rows(eq)["task0#1"][0]])
+    off = ms.apply_episode_cost_penalty(_with_cost(_aligned()), CP, False)
+    assert not np.array(off.non_tensor_batch[ms.COST_GATED_KEY], dtype=bool).any()
+    assert ms.compute_multi_segment_metrics(off)["multi_segment/cost_penalty/gated_groups"] == 0.0
+
+
+def test_cost_penalty_anchor_and_gate_guards():
+    for bad in ({"anchor": "median"}, {"anchor_quantile": 1.5}, {"min_pass_rate": 1.0}, {"min_pass_rate": -0.1}):
+        with pytest.raises(ValueError):
+            ms.apply_episode_cost_penalty(_with_cost(_aligned()), {**CP, **bad}, norm_adv_by_std_in_grpo=False)
+
+
+def test_cost_penalty_judges_solved_on_the_raw_scores():
+    # a KL-in-reward term on token_level_rewards must not move a solve below the threshold
+    batch = _with_cost(_aligned(), alias=False)
+    rows = _episode_rows(batch)
+    i = rows["task3#24"][-1]  # task 3, episode 0: solved, its reward on the final row
+    batch.batch["token_level_rewards"][i] -= 0.6 * (batch.batch["token_level_rewards"][i] != 0)
+    out = ms.apply_episode_cost_penalty(batch, CP, norm_adv_by_std_in_grpo=False)
+    assert out.non_tensor_batch[ms.COST_PENALTY_KEY][rows["task3#24"][0]] == pytest.approx(_want(_x(3, 0)))
+
+
+def test_cost_penalty_on_a_single_trace_batch_raises():
+    batch_in, gen = _make_batch(segments=[[1] * N] * 4)
+    gen.non_tensor_batch.pop(ms.SOURCE_INDEX_KEY)
+    plain = batch_in.union(gen)
+    cfg = OmegaConf.create({"multi_segment": {"cost_penalty": CP}})
+    with pytest.raises(ValueError, match="not multi-segment"):
+        compute_advantage(plain, AdvantageEstimator.GRPO, norm_adv_by_std_in_grpo=False, config=cfg)
+    off = OmegaConf.create({"multi_segment": {"cost_penalty": {**CP, "enable": False}}})
+    compute_advantage(plain, AdvantageEstimator.GRPO, norm_adv_by_std_in_grpo=False, config=off)  # disabled: fine
+
+
 # ---------------------------------------------------------------- baseline guard (min_baseline_episodes)
 def _lone_solve_flags():
     """Task 2: episode 0 is the only solve; exclude every other episode from the baseline -> a group of one."""
